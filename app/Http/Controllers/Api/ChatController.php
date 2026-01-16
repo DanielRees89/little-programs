@@ -16,6 +16,7 @@ use Prism\Prism\Facades\Prism;
 use Prism\Prism\Facades\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\Media\Image;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
@@ -24,11 +25,64 @@ class ChatController extends Controller
     protected PythonExecutionService $pythonService;
     protected string $model;
 
+    protected array $imageMimeTypes = [
+        'image/png',
+        'image/jpeg',
+        'image/gif',
+        'image/webp',
+    ];
+
+    protected array $dataMimeTypes = [
+        'text/csv',
+        'text/plain',
+        'application/csv',
+        'application/json',
+        'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ];
+
     public function __construct(PythonExecutionService $pythonService)
     {
         $this->pythonService = $pythonService;
         $this->pythonService->setTimeout(config('ai.agentic.python_timeout', 120));
         $this->model = config('ai.default_model', 'claude-sonnet-4-20250514');
+    }
+
+    /**
+     * Sanitize a string to ensure valid UTF-8 encoding
+     * This prevents "Malformed UTF-8 characters" errors when sending to APIs
+     */
+    protected function sanitizeUtf8(?string $text): string
+    {
+        if ($text === null) {
+            return '';
+        }
+        
+        // Convert to UTF-8 if not already, replacing invalid sequences
+        $text = mb_convert_encoding($text, 'UTF-8', 'UTF-8');
+        
+        // Remove any remaining invalid UTF-8 sequences
+        $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', '', $text);
+        
+        // Ensure the string is valid UTF-8
+        if (!mb_check_encoding($text, 'UTF-8')) {
+            $text = mb_convert_encoding($text, 'UTF-8', 'ISO-8859-1');
+        }
+        
+        return $text;
+    }
+
+    /**
+     * Truncate output to prevent massive payloads
+     */
+    protected function truncateOutput(string $output, int $maxLength = 50000): string
+    {
+        if (strlen($output) <= $maxLength) {
+            return $output;
+        }
+        
+        $truncated = substr($output, 0, $maxLength);
+        return $truncated . "\n\n... [Output truncated - " . number_format(strlen($output) - $maxLength) . " characters omitted]";
     }
 
     public function index(Request $request): JsonResponse
@@ -82,26 +136,19 @@ class ChatController extends Controller
         return response()->json(['message' => 'Conversation deleted']);
     }
 
-    /**
-     * Preview a file generated during chat execution (images, PDFs)
-     */
     public function previewFile(Request $request, string $executionId, string $filename): BinaryFileResponse|JsonResponse
     {
-        // Security: Validate execution ID format
         if (!preg_match('/^temp_[a-zA-Z0-9]{16}$/', $executionId)) {
             return response()->json(['message' => 'Invalid execution ID'], 400);
         }
 
-        // Security: Prevent directory traversal
         $filename = basename($filename);
-        
         $filePath = $this->pythonService->getGeneratedFile($executionId, $filename);
         
         if (!$filePath || !file_exists($filePath)) {
             return response()->json(['message' => 'File not found'], 404);
         }
 
-        // Determine content type
         $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
         $contentTypes = [
             'png' => 'image/png',
@@ -116,27 +163,19 @@ class ChatController extends Controller
             'xls' => 'application/vnd.ms-excel',
         ];
 
-        $contentType = $contentTypes[$extension] ?? 'application/octet-stream';
-
         return response()->file($filePath, [
-            'Content-Type' => $contentType,
+            'Content-Type' => $contentTypes[$extension] ?? 'application/octet-stream',
             'Cache-Control' => 'private, max-age=3600',
         ]);
     }
 
-    /**
-     * Download a file generated during chat execution
-     */
     public function downloadFile(Request $request, string $executionId, string $filename): BinaryFileResponse|JsonResponse
     {
-        // Security: Validate execution ID format
         if (!preg_match('/^temp_[a-zA-Z0-9]{16}$/', $executionId)) {
             return response()->json(['message' => 'Invalid execution ID'], 400);
         }
 
-        // Security: Prevent directory traversal
         $filename = basename($filename);
-        
         $filePath = $this->pythonService->getGeneratedFile($executionId, $filename);
         
         if (!$filePath || !file_exists($filePath)) {
@@ -146,10 +185,6 @@ class ChatController extends Controller
         return response()->download($filePath, $filename);
     }
 
-    /**
-     * Single unified endpoint - AI decides when to use tools
-     * Everything streams in real-time - thinking, tool calls, responses
-     */
     public function sendMessage(Request $request, ChatConversation $conversation): StreamedResponse|JsonResponse
     {
         if ($conversation->user_id !== $request->user()->id) {
@@ -164,7 +199,6 @@ class ChatController extends Controller
 
         $user = $request->user();
 
-        // Get any attached files (just context, not a mode switch)
         $attachedFiles = collect();
         if (!empty($validated['file_ids'])) {
             $attachedFiles = DataFile::whereIn('id', $validated['file_ids'])
@@ -172,29 +206,36 @@ class ChatController extends Controller
                 ->get();
         }
 
-        // Also get any files previously attached in this conversation
-        $conversationFileIds = $conversation->messages()
+        $conversationDataFileIds = $conversation->messages()
             ->whereNotNull('metadata->attached_files')
             ->get()
             ->pluck('metadata.attached_files')
             ->flatten(1)
+            ->filter(fn($f) => empty($f['is_image']))
             ->pluck('id')
             ->unique()
             ->toArray();
 
-        $allFiles = DataFile::whereIn('id', array_merge(
-            $attachedFiles->pluck('id')->toArray(),
-            $conversationFileIds
+        $currentDataFileIds = $attachedFiles
+            ->filter(fn($f) => $this->isDataFile($f->mime_type))
+            ->pluck('id')
+            ->toArray();
+
+        $allDataFiles = DataFile::whereIn('id', array_merge(
+            $currentDataFileIds,
+            $conversationDataFileIds
         ))->where('user_id', $user->id)->get();
 
-        // Save user message
         $userMessage = $conversation->messages()->create([
             'role' => 'user',
-            'content' => $validated['message'],
+            'content' => $this->sanitizeUtf8($validated['message']),
             'metadata' => $attachedFiles->isNotEmpty() ? [
                 'attached_files' => $attachedFiles->map(fn($f) => [
                     'id' => $f->id,
                     'name' => $f->name,
+                    'mime_type' => $f->mime_type,
+                    'is_image' => $this->isImageFile($f->mime_type),
+                    'path' => $f->path,
                 ])->toArray()
             ] : null,
         ]);
@@ -202,35 +243,56 @@ class ChatController extends Controller
         $conversation->touchLastMessage();
         $conversation->generateTitle();
 
-        // Build message history
-        $messageHistory = $conversation->messages()
-            ->orderBy('created_at', 'asc')
-            ->get()
-            ->map(fn($msg) => ['role' => $msg->role, 'content' => $msg->content])
-            ->toArray();
+        $messageHistory = $this->buildMessageHistory($conversation, $user);
 
         return $this->streamResponse(
             $conversation,
             $userMessage,
             $messageHistory,
             $user->name,
-            $allFiles->toArray()
+            $allDataFiles->toArray()
         );
     }
 
-    /**
-     * Unified streaming - AI always has tools, decides when to use them
-     * Everything visible in real-time
-     */
+    protected function buildMessageHistory(ChatConversation $conversation, $user): array
+    {
+        return $conversation->messages()
+            ->orderBy('created_at', 'asc')
+            ->get()
+            ->map(function ($msg) use ($user) {
+                $data = [
+                    'role' => $msg->role,
+                    'content' => $this->sanitizeUtf8($msg->content),
+                    'images' => [],
+                ];
+                
+                if ($msg->role === 'user' && !empty($msg->metadata['attached_files'])) {
+                    foreach ($msg->metadata['attached_files'] as $fileInfo) {
+                        if (!empty($fileInfo['is_image']) && !empty($fileInfo['path'])) {
+                            $fullPath = Storage::disk('local')->path($fileInfo['path']);
+                            if (file_exists($fullPath)) {
+                                $data['images'][] = [
+                                    'path' => $fullPath,
+                                    'name' => $fileInfo['name'] ?? 'image',
+                                ];
+                            }
+                        }
+                    }
+                }
+                
+                return $data;
+            })
+            ->toArray();
+    }
+
     protected function streamResponse(
         ChatConversation $conversation,
         ChatMessage $userMessage,
         array $messageHistory,
         string $userName,
-        array $availableFiles
+        array $availableDataFiles
     ): StreamedResponse {
-        return new StreamedResponse(function () use ($conversation, $userMessage, $messageHistory, $userName, $availableFiles) {
-            // Disable all buffering for true real-time streaming
+        return new StreamedResponse(function () use ($conversation, $userMessage, $messageHistory, $userName, $availableDataFiles) {
             while (ob_get_level()) ob_end_clean();
             
             $this->sendSSE('user_message', $this->formatMessage($userMessage));
@@ -241,32 +303,38 @@ class ChatController extends Controller
             $code = null;
             $language = null;
             $stepsTaken = 0;
-            $maxSteps = config('ai.agentic.max_steps', 10);
+            $maxSteps = config('ai.agentic.max_steps', 80);
 
             try {
-                // Prepare data files (if any exist)
-                $dataFilePaths = $this->prepareDataFiles($availableFiles);
-                
-                // Build system prompt
+                $dataFilePaths = $this->prepareDataFiles($availableDataFiles);
                 $systemPrompt = $this->loadPrompt('data-analysis', ['name' => $userName]);
                 
-                // Add file context if files are available
-                if (!empty($availableFiles)) {
-                    $systemPrompt .= $this->buildFileContext($availableFiles);
+                if (!empty($dataFilePaths)) {
+                    $systemPrompt .= $this->buildFileContext($availableDataFiles);
                 }
 
                 $prismMessages = $this->convertToPrismMessages($messageHistory);
+                
+                Log::info('Starting agent loop', [
+                    'message_count' => count($prismMessages),
+                    'has_data_files' => !empty($dataFilePaths),
+                    'max_steps' => $maxSteps,
+                ]);
 
-                // Create the Python tool - always available, AI decides when to use
-                $pythonTool = Tool::as('execute_python')
-                    ->for('Execute Python code to analyze data. Use this when you have enough information from the user and want to write and test analysis code. The data is pre-loaded as `df`. Always test your code before presenting it.')
-                    ->withStringParameter('code', 'The Python code to execute.');
+                $pythonTool = null;
+                if (!empty($dataFilePaths)) {
+                    $pythonTool = Tool::as('execute_python')
+                        ->for('Execute Python code to analyze data, create visualizations, or generate files (PDF, Excel, etc.). The data is pre-loaded as pandas DataFrames (df, df2, etc.). Use this tool as many times as needed to complete the analysis.')
+                        ->withStringParameter('code', 'The Python code to execute.');
+                }
 
-                // Agentic loop - AI controls the flow
+                $hadToolCalls = false;
+
                 while ($stepsTaken < $maxSteps) {
                     $stepsTaken++;
+                    
+                    Log::info('Agent step', ['step' => $stepsTaken]);
 
-                    // Build request - tools always available
                     $prismBuilder = Prism::text()
                         ->using('anthropic', $this->model)
                         ->withSystemPrompt($systemPrompt)
@@ -280,49 +348,54 @@ class ChatController extends Controller
                             ],
                         ]);
 
-                    // Only add tool if files are available (can't execute without data)
-                    if (!empty($dataFilePaths)) {
+                    if ($pythonTool) {
                         $prismBuilder->withTools([$pythonTool]);
                     }
 
                     $response = $prismBuilder->asText();
+                    
+                    $responseText = $response->text ?? '';
+                    
+                    Log::info('Agent response', [
+                        'step' => $stepsTaken,
+                        'text_length' => strlen($responseText),
+                        'has_steps' => !empty($response->steps),
+                        'step_count' => count($response->steps ?? []),
+                    ]);
 
-                    // IMMEDIATELY stream thinking (always visible)
                     $thinking = $this->extractThinking($response);
                     if ($thinking) {
-                        $allThinking .= ($allThinking ? "\n\n" : '') . $thinking;
+                        $allThinking .= ($allThinking ? "\n\n" : '') . $this->sanitizeUtf8($thinking);
                         $this->sendSSE('thinking', [
-                            'content' => $thinking,
+                            'content' => $this->sanitizeUtf8($thinking),
                             'full' => $allThinking,
                         ]);
                     }
 
-                    // Check if AI decided to use tools
                     $toolCalls = $this->extractToolCalls($response);
+                    
+                    Log::info('Tool calls extracted', ['count' => count($toolCalls)]);
 
                     if (!empty($toolCalls)) {
-                        // AI decided to execute code - show it happening
+                        $hadToolCalls = true;
+                        
                         foreach ($toolCalls as $tc) {
                             if ($tc['name'] === 'execute_python') {
                                 $pythonCode = $tc['arguments']['code'] ?? '';
 
-                                // Stream: show code being executed
                                 $this->sendSSE('tool_call', [
                                     'tool' => 'execute_python',
                                     'code' => $pythonCode,
                                     'step' => $stepsTaken,
                                 ]);
 
-                                // Execute
-                                $execResult = $this->pythonService->executeCode($pythonCode, $dataFilePaths);
-
-                                // Extract execution ID from the directory path
+                                $execResult = $this->pythonService->executeCode($pythonCode, $dataFilePaths, (string) $conversation->id);
+                                
                                 $executionId = null;
                                 if (!empty($execResult['execution_dir'])) {
                                     $executionId = basename($execResult['execution_dir']);
                                 }
 
-                                // Build file URLs for frontend
                                 $chartsWithUrls = array_map(function ($chart) use ($executionId) {
                                     return [
                                         'filename' => $chart['filename'],
@@ -351,24 +424,27 @@ class ChatController extends Controller
                                     ];
                                 }, $execResult['files'] ?? []);
 
+                                // Sanitize and truncate output
+                                $cleanOutput = $this->sanitizeUtf8($execResult['output'] ?? '');
+                                $cleanOutput = $this->truncateOutput($cleanOutput);
+                                $cleanError = $this->sanitizeUtf8($execResult['error'] ?? '');
+
                                 $record = [
                                     'code' => $pythonCode,
                                     'success' => $execResult['success'],
-                                    'output' => $execResult['output'] ?? '',
-                                    'error' => $execResult['error'] ?? null,
+                                    'output' => $cleanOutput,
+                                    'error' => $cleanError ?: null,
                                     'charts' => $chartsWithUrls,
                                     'files' => $filesWithUrls,
                                     'execution_id' => $executionId,
                                 ];
                                 $executionResults[] = $record;
 
-                                // Stream: show result with URLs
                                 $this->sendSSE('tool_result', $record);
 
-                                // Add to conversation for AI to see
                                 $resultText = $execResult['success']
-                                    ? "✅ Code executed successfully.\n\nOutput:\n" . ($execResult['output'] ?: '(no output)')
-                                    : "❌ Code failed.\n\nError:\n" . ($execResult['error'] ?? 'Unknown error');
+                                    ? "✅ Code executed successfully.\n\nOutput:\n" . ($cleanOutput ?: '(no output)')
+                                    : "❌ Code failed.\n\nError:\n" . ($cleanError ?: 'Unknown error');
 
                                 if (!empty($chartsWithUrls)) {
                                     $resultText .= "\n\nGenerated charts: " . implode(', ', array_column($chartsWithUrls, 'filename'));
@@ -377,39 +453,85 @@ class ChatController extends Controller
                                     $resultText .= "\n\nGenerated files: " . implode(', ', array_column($filesWithUrls, 'filename'));
                                 }
 
-                                $prismMessages[] = new AssistantMessage($response->text ?: 'Let me test this code.');
-                                $prismMessages[] = new UserMessage("Execution result:\n\n" . $resultText);
+                                // Truncate result text for context to avoid bloating
+                                $resultText = $this->truncateOutput($resultText, 30000);
+
+                                // Add assistant's message (might be empty if it just called a tool)
+                                $assistantText = $this->sanitizeUtf8($responseText) ?: 'Running analysis...';
+                                $prismMessages[] = new AssistantMessage($assistantText);
+                                $prismMessages[] = new UserMessage("Tool execution result:\n\n" . $resultText);
                             }
                         }
-                        // Continue loop - AI will see results and decide next action
                         continue;
                     }
 
-                    // No tool calls - AI is responding with final message
-                    $finalContent = $response->text ?? '';
+                    // No tool calls - this is the final response
+                    $finalContent = $this->sanitizeUtf8($responseText);
+                    
+                    Log::info('Final response received', ['length' => strlen($finalContent)]);
 
-                    // Stream the response text
+                    if (!empty($finalContent)) {
+                        $chunks = mb_str_split($finalContent, 25);
+                        foreach ($chunks as $chunk) {
+                            $this->sendSSE('text_delta', ['delta' => $chunk]);
+                            usleep(5000);
+                        }
+                    }
+
+                    break;
+                }
+
+                // If we hit max steps but had tool calls, force a final summary
+                if ($stepsTaken >= $maxSteps && $hadToolCalls && empty($finalContent)) {
+                    Log::warning('Hit max steps, requesting final summary');
+                    
+                    $prismMessages[] = new UserMessage(
+                        "You've completed your analysis. Please provide a summary of what you found and what files were generated. Do not run any more code."
+                    );
+                    
+                    $summaryResponse = Prism::text()
+                        ->using('anthropic', $this->model)
+                        ->withSystemPrompt($systemPrompt)
+                        ->withMessages($prismMessages)
+                        ->withMaxTokens(config('ai.tokens.medium', 8000))
+                        ->withClientOptions(['timeout' => 120])
+                        ->asText();
+                    
+                    $finalContent = $this->sanitizeUtf8($summaryResponse->text ?? 'Analysis complete. Please check the generated files above.');
+                    
                     $chunks = mb_str_split($finalContent, 25);
                     foreach ($chunks as $chunk) {
                         $this->sendSSE('text_delta', ['delta' => $chunk]);
                         usleep(5000);
                     }
-
-                    break; // Done
                 }
 
-                // Parse for code blocks in final response
+                // If still no content, provide a default message
+                if (empty($finalContent) && !empty($executionResults)) {
+                    $finalContent = "I've completed the analysis. You can see the execution results above, including any generated charts and files.";
+                    
+                    $chunks = mb_str_split($finalContent, 25);
+                    foreach ($chunks as $chunk) {
+                        $this->sendSSE('text_delta', ['delta' => $chunk]);
+                        usleep(5000);
+                    }
+                }
+
                 $parsed = $this->parseResponse($finalContent);
                 $code = $parsed['code'];
                 $language = $parsed['language'];
 
             } catch (\Exception $e) {
-                Log::error('Chat error', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+                Log::error('Chat error', [
+                    'error' => $e->getMessage(),
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                    'trace' => $e->getTraceAsString()
+                ]);
                 $this->sendSSE('error', ['message' => $e->getMessage()]);
                 $finalContent = "I encountered an error: " . $e->getMessage();
             }
 
-            // Save assistant message
             $assistantMessage = $conversation->messages()->create([
                 'role' => 'assistant',
                 'content' => $finalContent,
@@ -419,7 +541,7 @@ class ChatController extends Controller
                 'metadata' => [
                     'steps_taken' => $stepsTaken,
                     'execution_results' => $executionResults,
-                    'had_tool_calls' => !empty($executionResults),
+                    'had_tool_calls' => $hadToolCalls,
                 ],
             ]);
 
@@ -444,7 +566,7 @@ class ChatController extends Controller
     protected function sendSSE(string $event, array $data): void
     {
         echo "event: {$event}\n";
-        echo "data: " . json_encode($data) . "\n\n";
+        echo "data: " . json_encode($data, JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR) . "\n\n";
         flush();
     }
 
@@ -454,7 +576,9 @@ class ChatController extends Controller
         foreach ($files as $file) {
             $path = is_array($file) ? ($file['path'] ?? null) : ($file->path ?? null);
             $name = is_array($file) ? ($file['name'] ?? 'data.csv') : ($file->name ?? 'data.csv');
-            if ($path) {
+            $mimeType = is_array($file) ? ($file['mime_type'] ?? '') : ($file->mime_type ?? '');
+            
+            if ($path && $this->isDataFile($mimeType)) {
                 $fullPath = Storage::disk('local')->path($path);
                 if (file_exists($fullPath)) {
                     $paths[] = ['path' => $fullPath, 'name' => $name];
@@ -476,16 +600,23 @@ class ChatController extends Controller
     protected function buildFileContext(array $files): string
     {
         $ctx = "\n\n---\n## Available Data Files\n\n";
-        $ctx .= "You have access to the following data. When you're ready to analyze, use the `execute_python` tool.\n\n";
+        $ctx .= "You have access to the following data files. Use the `execute_python` tool to analyze them.\n\n";
         
-        foreach ($files as $i => $f) {
+        $dataFileIndex = 0;
+        foreach ($files as $f) {
+            $mimeType = is_array($f) ? ($f['mime_type'] ?? '') : ($f->mime_type ?? '');
+            
+            if (!$this->isDataFile($mimeType)) {
+                continue;
+            }
+            
             $name = is_array($f) ? $f['name'] : $f->name;
             $rows = is_array($f) ? ($f['row_count'] ?? '?') : ($f->row_count ?? '?');
             $cols = is_array($f) ? ($f['column_count'] ?? '?') : ($f->column_count ?? '?');
             $meta = is_array($f) ? ($f['columns_metadata'] ?? []) : ($f->columns_metadata ?? []);
             $path = is_array($f) ? ($f['path'] ?? null) : ($f->path ?? null);
             
-            $var = $i === 0 ? 'df' : 'df' . ($i + 1);
+            $var = $dataFileIndex === 0 ? 'df' : 'df' . ($dataFileIndex + 1);
             $ctx .= "### {$name} → `{$var}`\n";
             $ctx .= "- **Size:** {$rows} rows × {$cols} columns\n";
 
@@ -495,13 +626,13 @@ class ChatController extends Controller
                 $ctx .= "\n";
             }
 
-            // Preview first few rows
             if ($path) {
                 $fullPath = Storage::disk('local')->path($path);
                 if (file_exists($fullPath) && ($handle = fopen($fullPath, 'r'))) {
                     $preview = [];
                     for ($j = 0; $j < 4 && ($line = fgets($handle)); $j++) {
-                        $preview[] = rtrim($line);
+                        // Sanitize preview lines for UTF-8
+                        $preview[] = $this->sanitizeUtf8(rtrim($line));
                     }
                     fclose($handle);
                     if (!empty($preview)) {
@@ -510,7 +641,9 @@ class ChatController extends Controller
                 }
             }
             $ctx .= "\n";
+            $dataFileIndex++;
         }
+        
         return $ctx;
     }
 
@@ -518,8 +651,42 @@ class ChatController extends Controller
     {
         $result = [];
         foreach ($msgs as $m) {
-            if ($m['role'] === 'assistant') $result[] = new AssistantMessage($m['content']);
-            elseif ($m['role'] === 'user') $result[] = new UserMessage($m['content']);
+            // Ensure content is sanitized
+            $content = $this->sanitizeUtf8($m['content'] ?? '');
+            
+            if ($m['role'] === 'assistant') {
+                $result[] = new AssistantMessage($content);
+            } elseif ($m['role'] === 'user') {
+                $images = [];
+                
+                if (!empty($m['images'])) {
+                    foreach ($m['images'] as $imgInfo) {
+                        $path = $imgInfo['path'];
+                        $name = $imgInfo['name'] ?? 'image.png';
+                        
+                        if (!file_exists($path)) {
+                            Log::warning('Image file not found', ['path' => $path]);
+                            continue;
+                        }
+                        
+                        try {
+                            $image = Image::fromLocalPath(path: $path)->as($name);
+                            $images[] = $image;
+                        } catch (\Exception $e) {
+                            Log::error('Failed to create Image object', [
+                                'path' => $path,
+                                'error' => $e->getMessage(),
+                            ]);
+                        }
+                    }
+                }
+                
+                if (!empty($images)) {
+                    $result[] = new UserMessage($content, $images);
+                } else {
+                    $result[] = new UserMessage($content);
+                }
+            }
         }
         return $result;
     }
@@ -556,6 +723,18 @@ class ChatController extends Controller
             }
         }
         return ['content' => trim($c), 'code' => $code, 'language' => $lang];
+    }
+
+    protected function isImageFile(?string $mimeType): bool
+    {
+        if (!$mimeType) return false;
+        return in_array($mimeType, $this->imageMimeTypes);
+    }
+
+    protected function isDataFile(?string $mimeType): bool
+    {
+        if (!$mimeType) return false;
+        return in_array($mimeType, $this->dataMimeTypes);
     }
 
     protected function formatConversation(ChatConversation $c): array

@@ -43,13 +43,17 @@ class DashboardController extends Controller
     public function chat(Request $request): Response
     {
         $user = $request->user();
+        $conversation = null;
 
-        $conversations = $user->chatConversations()
-            ->orderBy('last_message_at', 'desc')
-            ->get(['id', 'title', 'last_message_at', 'created_at']);
+        // Load specific conversation if requested
+        if ($request->has('conversation')) {
+            $conversation = $user->chatConversations()
+                ->where('id', $request->get('conversation'))
+                ->first(['id', 'title', 'last_message_at', 'created_at']);
+        }
 
         return Inertia::render('Chat/Index', [
-            'conversations' => $conversations,
+            'conversation' => $conversation,
         ]);
     }
 

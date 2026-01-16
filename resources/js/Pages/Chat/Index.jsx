@@ -1,12 +1,12 @@
 import { useState, useRef, useEffect } from 'react';
-import { Head } from '@inertiajs/react';
+import { Head, router, usePage } from '@inertiajs/react';
 import AppLayout from '@/Layouts/AppLayout';
-import { Card, EmptyState } from '@/Components/UI';
+import { EmptyState } from '@/Components/UI';
 import { ChatMessage, ChatInput, SaveScriptModal, ResultsPanel } from '@/Components/Chat';
 
-export default function ChatIndex({ conversations: initialConversations = [] }) {
-    const [conversations, setConversations] = useState(initialConversations);
-    const [currentConversation, setCurrentConversation] = useState(null);
+export default function ChatIndex({ conversation: initialConversation = null }) {
+    const { chatConversations } = usePage().props;
+    const [currentConversation, setCurrentConversation] = useState(initialConversation);
     const [messages, setMessages] = useState([]);
     const [isLoading, setIsLoading] = useState(false);
     const [loadingStatus, setLoadingStatus] = useState('');
@@ -17,13 +17,20 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
     const [showResults, setShowResults] = useState(false);
     const [currentResults, setCurrentResults] = useState([]);
     
-    // Streaming state - now includes tool executions
+    // Streaming state
     const [streamingMessage, setStreamingMessage] = useState(null);
     const [streamingThinking, setStreamingThinking] = useState('');
     const [streamingContent, setStreamingContent] = useState('');
     const [streamingExecutions, setStreamingExecutions] = useState([]);
     
     const messagesEndRef = useRef(null);
+
+    // Load conversation from URL or initial prop
+    useEffect(() => {
+        if (initialConversation) {
+            loadConversation(initialConversation);
+        }
+    }, [initialConversation?.id]);
 
     // Auto-scroll to bottom when new messages arrive
     useEffect(() => {
@@ -58,7 +65,10 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
 
             const data = await response.json();
             setCurrentConversation(data.conversation);
-            setConversations([data.conversation, ...conversations]);
+            
+            // Refresh the page to update sidebar conversations
+            router.reload({ only: ['chatConversations'] });
+            
             return data.conversation;
         } catch (err) {
             console.error('Error creating conversation:', err);
@@ -144,9 +154,11 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                 ));
             }
 
-            // Always use streaming - it handles everything now
             setLoadingStatus('Thinking...');
             await sendStreamingMessage(conversation.id, content, fileIds, userMessage.id);
+
+            // Refresh sidebar conversations after message sent
+            router.reload({ only: ['chatConversations'] });
 
         } catch (err) {
             console.error('Error sending message:', err);
@@ -159,14 +171,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
         }
     };
 
-    /**
-     * Unified streaming that handles ALL events:
-     * - thinking: AI's reasoning
-     * - tool_call: Code being executed (show it!)
-     * - tool_result: Execution output, charts, files
-     * - text_delta: Response text
-     * - complete: Final message
-     */
     const sendStreamingMessage = async (conversationId, content, fileIds, tempUserMessageId) => {
         return new Promise((resolve, reject) => {
             const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
@@ -210,14 +214,12 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                 const processEvent = (eventType, data) => {
                     switch (eventType) {
                         case 'thinking':
-                            // AI is thinking - show it
                             currentThinking = data.full || data.content || '';
                             setStreamingThinking(currentThinking);
                             setLoadingStatus('Thinking...');
                             break;
 
                         case 'tool_call':
-                            // AI is executing code - show the code
                             setLoadingStatus(`Running Python (step ${data.step || 1})...`);
                             currentExecutions = [
                                 ...currentExecutions,
@@ -231,8 +233,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                             break;
 
                         case 'tool_result':
-                            // Execution complete - show results
-                            // Update the last execution with results
                             const lastIdx = currentExecutions.length - 1;
                             if (lastIdx >= 0) {
                                 currentExecutions[lastIdx] = {
@@ -246,8 +246,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                                     execution_id: data.execution_id,
                                 };
                                 setStreamingExecutions([...currentExecutions]);
-                                
-                                // Update results panel
                                 setCurrentResults([...currentExecutions.filter(e => e.status === 'complete')]);
                             }
                             
@@ -259,7 +257,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                             break;
 
                         case 'text_delta':
-                            // Response text streaming
                             const delta = data.delta || '';
                             currentContent += delta;
                             setStreamingContent(currentContent);
@@ -267,7 +264,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                             break;
 
                         case 'complete':
-                            // Final message from server
                             finalMessage = data.assistant_message;
                             break;
 
@@ -275,15 +271,12 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                             throw new Error(data.message || 'Stream error');
 
                         case 'done':
-                            // Stream finished
                             break;
                     }
                 };
 
                 const processLine = (line) => {
-                    // Parse SSE format
                     if (line.startsWith('event:')) {
-                        // Store event type for next data line
                         buffer = line.slice(6).trim();
                         return;
                     }
@@ -294,10 +287,9 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                         
                         try {
                             const data = JSON.parse(jsonStr);
-                            // Use stored event type or try to infer from data
                             const eventType = buffer || data.type || 'unknown';
                             processEvent(eventType, data);
-                            buffer = ''; // Clear after processing
+                            buffer = '';
                         } catch (e) {
                             if (!(e instanceof SyntaxError)) {
                                 console.error('Error processing stream event:', e);
@@ -324,7 +316,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                             }
                         }
                         
-                        // Process any remaining content
                         if (lineBuffer.trim()) {
                             processLine(lineBuffer.trim());
                         }
@@ -333,7 +324,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                         setIsLoading(false);
                         setLoadingStatus('');
                         
-                        // Use final message from server if available, otherwise construct from streamed data
                         const message = finalMessage || {
                             id: streamingMsgId,
                             role: 'assistant',
@@ -348,7 +338,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                             },
                         };
                         
-                        // Update final results
                         if (message.metadata?.execution_results) {
                             setCurrentResults(message.metadata.execution_results);
                         }
@@ -362,7 +351,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                             return [...filtered, realUserMessage, message];
                         });
                         
-                        // Clear streaming state
                         setStreamingMessage(null);
                         setStreamingThinking('');
                         setStreamingContent('');
@@ -389,10 +377,8 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
     };
 
     const handleSaveScript = (message) => {
-        // Get code from message or from execution results
         let code = message.code;
         if (!code && message.metadata?.execution_results?.length > 0) {
-            // Use the last successful execution's code
             const lastSuccess = [...message.metadata.execution_results]
                 .reverse()
                 .find(e => e.success);
@@ -455,7 +441,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
             const data = await response.json();
             setMessages(data.messages || []);
             
-            // Load results from the last message with execution results
             const lastAgenticMessage = [...(data.messages || [])].reverse().find(m => 
                 m.role === 'assistant' && m.metadata?.execution_results?.length > 0
             );
@@ -468,18 +453,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
         }
     };
 
-    const startNewConversation = () => {
-        setCurrentConversation(null);
-        setMessages([]);
-        setError(null);
-        setStreamingMessage(null);
-        setStreamingThinking('');
-        setStreamingContent('');
-        setStreamingExecutions([]);
-        setCurrentResults([]);
-        setShowResults(false);
-    };
-
     const suggestions = [
         "Analyze the distribution of values in my data",
         "Find and visualize outliers",
@@ -487,7 +460,6 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
         "Export my analysis to Excel",
     ];
 
-    // Build the streaming message with all current state
     const displayStreamingMessage = streamingMessage ? {
         ...streamingMessage,
         thinking: streamingThinking || null,
@@ -497,52 +469,17 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
         },
     } : null;
 
-    // Check if we have any files in results
     const hasResultFiles = currentResults.some(r => 
         (r.charts && r.charts.length > 0) || (r.files && r.files.length > 0)
     );
 
     return (
-        <AppLayout title="Chat">
+        <AppLayout title="Chat" currentConversationId={currentConversation?.id}>
             <Head title="Chat" />
 
             <div className="h-[calc(100vh-8rem)] flex">
-                {/* Conversation sidebar */}
-                <div className="hidden lg:flex lg:flex-col lg:w-64 lg:flex-shrink-0 lg:border-r lg:border-paper-200 lg:bg-paper-50">
-                    <div className="p-3 border-b border-paper-200">
-                        <button
-                            onClick={startNewConversation}
-                            className="w-full px-3 py-2 text-sm font-medium text-punch-600 bg-white hover:bg-punch-50 border border-punch-200 rounded-lg transition-colors"
-                        >
-                            + New conversation
-                        </button>
-                    </div>
-                    
-                    <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                        {conversations.map((conv) => (
-                            <button
-                                key={conv.id}
-                                onClick={() => loadConversation(conv)}
-                                className={`w-full px-3 py-2 text-left text-sm rounded-lg transition-colors truncate ${
-                                    currentConversation?.id === conv.id
-                                        ? 'bg-punch-100 text-punch-700 font-medium'
-                                        : 'text-paper-600 hover:bg-paper-100'
-                                }`}
-                            >
-                                {conv.title || 'New conversation'}
-                            </button>
-                        ))}
-                        
-                        {conversations.length === 0 && (
-                            <p className="text-paper-400 text-sm text-center py-4">
-                                No conversations yet
-                            </p>
-                        )}
-                    </div>
-                </div>
-
-                {/* Main chat area */}
-                <div className={`flex-1 flex flex-col min-w-0 bg-white ${showResults && hasResultFiles ? 'lg:w-1/2' : ''}`}>
+                {/* Main chat area - now full width */}
+                <div className={`flex-1 flex flex-col min-w-0 bg-white rounded-lg border border-paper-200 ${showResults && hasResultFiles ? 'lg:mr-4' : ''}`}>
                     {error && (
                         <div className="flex-shrink-0 mx-4 mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm flex items-center justify-between">
                             <span>{error}</span>
@@ -623,7 +560,7 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                         </div>
                     </div>
 
-                    <div className="flex-shrink-0 border-t border-paper-200 bg-paper-50">
+                    <div className="flex-shrink-0 border-t border-paper-200 bg-paper-50 rounded-b-lg">
                         <div className="max-w-3xl mx-auto px-4 py-4">
                             <ChatInput
                                 onSend={handleSend}
@@ -634,7 +571,7 @@ export default function ChatIndex({ conversations: initialConversations = [] }) 
                     </div>
                 </div>
 
-                {/* Results panel - shows on desktop when we have files */}
+                {/* Results panel */}
                 {hasResultFiles && (
                     <div className={`hidden lg:block lg:w-96 lg:flex-shrink-0 transition-all duration-300 ${
                         showResults ? 'lg:opacity-100' : 'lg:opacity-0 lg:w-0 lg:overflow-hidden'

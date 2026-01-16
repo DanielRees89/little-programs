@@ -37,7 +37,7 @@ class DataFileController extends Controller
     public function store(Request $request): JsonResponse
     {
         $request->validate([
-            'file' => 'required|file|mimes:csv,txt|max:10240', // 10MB max
+            'file' => 'required|file|mimes:csv,txt,json,pdf,png,jpg,jpeg,gif,webp,xls,xlsx|max:10240', // 10MB max
         ]);
 
         $uploadedFile = $request->file('file');
@@ -46,26 +46,31 @@ class DataFileController extends Controller
         // Store the file
         $path = $uploadedFile->store("user-files/{$user->id}", 'local');
 
+        // Determine mime type
+        $mimeType = $uploadedFile->getMimeType() ?? $this->guessMimeType($uploadedFile->getClientOriginalExtension());
+
         // Create the database record
         $dataFile = $user->dataFiles()->create([
             'name' => $uploadedFile->getClientOriginalName(),
             'path' => $path,
             'size' => $uploadedFile->getSize(),
-            'mime_type' => $uploadedFile->getMimeType() ?? 'text/csv',
+            'mime_type' => $mimeType,
         ]);
 
-        // Parse the file to extract metadata
-        try {
-            $metadata = $this->fileParser->parseCSV($path);
-            
-            $dataFile->update([
-                'row_count' => $metadata['row_count'],
-                'column_count' => $metadata['column_count'],
-                'columns_metadata' => $metadata['columns_metadata'],
-            ]);
-        } catch (\Exception $e) {
-            // Log error but don't fail the upload
-            \Log::warning("Failed to parse CSV metadata: " . $e->getMessage());
+        // Parse the file to extract metadata (only for CSV/data files)
+        if ($this->isDataFile($mimeType)) {
+            try {
+                $metadata = $this->fileParser->parseCSV($path);
+                
+                $dataFile->update([
+                    'row_count' => $metadata['row_count'],
+                    'column_count' => $metadata['column_count'],
+                    'columns_metadata' => $metadata['columns_metadata'],
+                ]);
+            } catch (\Exception $e) {
+                // Log error but don't fail the upload
+                \Log::warning("Failed to parse CSV metadata: " . $e->getMessage());
+            }
         }
 
         return response()->json([
@@ -84,17 +89,52 @@ class DataFileController extends Controller
             return response()->json(['message' => 'Not found'], 404);
         }
 
-        // Get preview data
+        // Get preview data (only for data files)
         $preview = null;
-        try {
-            $preview = $this->fileParser->getPreview($dataFile->path, 20);
-        } catch (\Exception $e) {
-            \Log::warning("Failed to get file preview: " . $e->getMessage());
+        if ($this->isDataFile($dataFile->mime_type)) {
+            try {
+                $preview = $this->fileParser->getPreview($dataFile->path, 20);
+            } catch (\Exception $e) {
+                \Log::warning("Failed to get file preview: " . $e->getMessage());
+            }
+        }
+
+        // For images, provide a URL for preview
+        $imageUrl = null;
+        if ($this->isImageFile($dataFile->mime_type)) {
+            $imageUrl = route('api.files.image', $dataFile);
         }
 
         return response()->json([
             'file' => $this->formatFile($dataFile),
             'preview' => $preview,
+            'image_url' => $imageUrl,
+        ]);
+    }
+
+    /**
+     * Serve image file for preview.
+     */
+    public function image(Request $request, DataFile $dataFile)
+    {
+        // Ensure user owns this file
+        if ($dataFile->user_id !== $request->user()->id) {
+            return response()->json(['message' => 'Not found'], 404);
+        }
+
+        // Ensure it's an image
+        if (!$this->isImageFile($dataFile->mime_type)) {
+            return response()->json(['message' => 'Not an image file'], 400);
+        }
+
+        $fullPath = Storage::disk('local')->path($dataFile->path);
+
+        if (!file_exists($fullPath)) {
+            return response()->json(['message' => 'File not found on disk'], 404);
+        }
+
+        return response()->file($fullPath, [
+            'Content-Type' => $dataFile->mime_type,
         ]);
     }
 
@@ -148,8 +188,58 @@ class DataFileController extends Controller
             'row_count' => $file->row_count,
             'column_count' => $file->column_count,
             'columns_metadata' => $file->columns_metadata,
+            'is_image' => $this->isImageFile($file->mime_type),
+            'is_data_file' => $this->isDataFile($file->mime_type),
             'created_at' => $file->created_at->toISOString(),
             'updated_at' => $file->updated_at->toISOString(),
         ];
+    }
+
+    /**
+     * Check if mime type is an image.
+     */
+    protected function isImageFile(?string $mimeType): bool
+    {
+        if (!$mimeType) return false;
+        return str_starts_with($mimeType, 'image/');
+    }
+
+    /**
+     * Check if mime type is a data/CSV file.
+     */
+    protected function isDataFile(?string $mimeType): bool
+    {
+        if (!$mimeType) return false;
+        
+        $dataTypes = [
+            'text/csv',
+            'text/plain',
+            'application/csv',
+            'application/json',
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        ];
+        
+        return in_array($mimeType, $dataTypes);
+    }
+
+    /**
+     * Guess mime type from extension.
+     */
+    protected function guessMimeType(string $extension): string
+    {
+        return match (strtolower($extension)) {
+            'csv' => 'text/csv',
+            'txt' => 'text/plain',
+            'json' => 'application/json',
+            'pdf' => 'application/pdf',
+            'png' => 'image/png',
+            'jpg', 'jpeg' => 'image/jpeg',
+            'gif' => 'image/gif',
+            'webp' => 'image/webp',
+            'xls' => 'application/vnd.ms-excel',
+            'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            default => 'application/octet-stream',
+        };
     }
 }

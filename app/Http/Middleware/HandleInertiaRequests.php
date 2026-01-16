@@ -2,6 +2,7 @@
 
 namespace App\Http\Middleware;
 
+use App\Models\ChatConversation;
 use Illuminate\Http\Request;
 use Inertia\Middleware;
 
@@ -34,6 +35,12 @@ class HandleInertiaRequests extends Middleware
             'auth' => [
                 'user' => $request->user(),
             ],
+            'chatConversations' => fn () => $request->user()
+                ? ChatConversation::where('user_id', $request->user()->id)
+                    ->orderBy('updated_at', 'desc')
+                    ->take(20)
+                    ->get(['id', 'title', 'updated_at'])
+                : [],
         ];
     }
 }

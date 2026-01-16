@@ -84,6 +84,47 @@ export default function ChatInput({ onSend, disabled = false, placeholder }) {
         addFiles(files);
     };
 
+    // Handle clipboard paste for images
+    const handlePaste = (e) => {
+        const clipboardData = e.clipboardData;
+        if (!clipboardData) return;
+
+        const items = Array.from(clipboardData.items || []);
+        const imageItems = items.filter(item => item.type.startsWith('image/'));
+
+        if (imageItems.length > 0) {
+            e.preventDefault(); // Prevent pasting image as text
+            
+            const files = imageItems
+                .map(item => {
+                    const file = item.getAsFile();
+                    if (file) {
+                        // Give pasted images a meaningful name with timestamp
+                        const extension = file.type.split('/')[1] || 'png';
+                        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+                        const newFile = new File([file], `pasted-image-${timestamp}.${extension}`, {
+                            type: file.type,
+                        });
+                        return newFile;
+                    }
+                    return null;
+                })
+                .filter(Boolean);
+
+            if (files.length > 0) {
+                addFiles(files);
+            }
+        }
+    };
+
+    // Generate preview URL for image files
+    const getFilePreview = (file) => {
+        if (file.type.startsWith('image/')) {
+            return URL.createObjectURL(file);
+        }
+        return null;
+    };
+
     return (
         <form 
             onSubmit={handleSubmit} 
@@ -95,24 +136,54 @@ export default function ChatInput({ onSend, disabled = false, placeholder }) {
             {/* Attached files preview */}
             {attachedFiles.length > 0 && (
                 <div className="flex flex-wrap gap-2 mb-3">
-                    {attachedFiles.map((file, index) => (
-                        <div
-                            key={index}
-                            className="flex items-center gap-2 px-3 py-1.5 bg-paper-100 rounded-full text-sm"
-                        >
-                            <FileTypeIcon type={file.type} className="w-4 h-4 text-paper-500" />
-                            <span className="text-paper-700 max-w-[150px] truncate">
-                                {file.name}
-                            </span>
-                            <button
-                                type="button"
-                                onClick={() => removeFile(index)}
-                                className="p-0.5 hover:bg-paper-200 rounded-full transition-colors"
+                    {attachedFiles.map((file, index) => {
+                        const imagePreview = getFilePreview(file);
+                        
+                        return (
+                            <div
+                                key={index}
+                                className={`relative group ${
+                                    imagePreview 
+                                        ? 'w-20 h-20 rounded-lg overflow-hidden border-2 border-paper-200' 
+                                        : 'flex items-center gap-2 px-3 py-1.5 bg-paper-100 rounded-full'
+                                }`}
                             >
-                                <XIcon className="w-3.5 h-3.5 text-paper-400" />
-                            </button>
-                        </div>
-                    ))}
+                                {imagePreview ? (
+                                    <>
+                                        <img 
+                                            src={imagePreview} 
+                                            alt={file.name}
+                                            className="w-full h-full object-cover"
+                                            onLoad={() => URL.revokeObjectURL(imagePreview)}
+                                        />
+                                        <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors flex items-center justify-center">
+                                            <button
+                                                type="button"
+                                                onClick={() => removeFile(index)}
+                                                className="p-1.5 bg-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity shadow-lg"
+                                            >
+                                                <XIcon className="w-4 h-4 text-paper-600" />
+                                            </button>
+                                        </div>
+                                    </>
+                                ) : (
+                                    <>
+                                        <FileTypeIcon type={file.type} className="w-4 h-4 text-paper-500" />
+                                        <span className="text-paper-700 max-w-[150px] truncate text-sm">
+                                            {file.name}
+                                        </span>
+                                        <button
+                                            type="button"
+                                            onClick={() => removeFile(index)}
+                                            className="p-0.5 hover:bg-paper-200 rounded-full transition-colors"
+                                        >
+                                            <XIcon className="w-3.5 h-3.5 text-paper-400" />
+                                        </button>
+                                    </>
+                                )}
+                            </div>
+                        );
+                    })}
                 </div>
             )}
 
@@ -142,6 +213,7 @@ export default function ChatInput({ onSend, disabled = false, placeholder }) {
                         value={message}
                         onChange={(e) => setMessage(e.target.value)}
                         onKeyDown={handleKeyDown}
+                        onPaste={handlePaste}
                         placeholder={placeholder || "Describe what you want to analyze..."}
                         disabled={disabled}
                         rows={1}
@@ -170,7 +242,7 @@ export default function ChatInput({ onSend, disabled = false, placeholder }) {
                 </Button>
             </div>
             <p className="text-paper-400 text-xs mt-2 text-center">
-                Press Enter to send • Shift+Enter for new line • Drag files or click 📎 to attach
+                Press Enter to send • Shift+Enter for new line • Paste or drag images • Click 📎 to attach files
             </p>
         </form>
     );

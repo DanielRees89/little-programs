@@ -23,6 +23,7 @@ Route::middleware(['web', 'auth'])->group(function () {
     Route::get('/files/{dataFile}', [DataFileController::class, 'show']);
     Route::delete('/files/{dataFile}', [DataFileController::class, 'destroy']);
     Route::get('/files/{dataFile}/download', [DataFileController::class, 'download']);
+    Route::get('/files/{dataFile}/image', [DataFileController::class, 'image'])->name('api.files.image');
 
     // Scripts
     Route::get('/scripts', [ScriptController::class, 'index']);
