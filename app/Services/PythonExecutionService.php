@@ -24,16 +24,21 @@ class PythonExecutionService
 
     /**
      * Execute code directly without a ScriptExecution model
+     * Files are saved to session directory for persistence across executions
      */
     public function executeCode(string $code, array $dataFiles = [], ?string $sessionId = null): array
     {
         $tempId = 'temp_' . Str::random(16);
         $executionDir = $this->prepareExecutionDirectory($tempId);
+        
+        // Use session directory for file output if session exists
+        // This ensures files persist across multiple executions in same conversation
         $sessionDir = $sessionId ? $this->getSessionDirectory($sessionId) : null;
+        $outputDir = $sessionDir ? $this->getSessionOutputDirectory($sessionId) : $executionDir;
 
         try {
             $originalDfNames = $this->getOriginalDataFrameNames(count($dataFiles));
-            $preparedScript = $this->prepareScript($code, $dataFiles, $executionDir, $sessionDir, $originalDfNames);
+            $preparedScript = $this->prepareScript($code, $dataFiles, $outputDir, $sessionDir, $originalDfNames);
             $scriptPath = "{$executionDir}/script.py";
             file_put_contents($scriptPath, $preparedScript);
 
@@ -41,6 +46,7 @@ class PythonExecutionService
                 'temp_id' => $tempId,
                 'file_count' => count($dataFiles),
                 'session_id' => $sessionId,
+                'output_dir' => $outputDir,
             ]);
 
             $result = Process::path($executionDir)
@@ -57,14 +63,20 @@ class PythonExecutionService
             ]);
 
             if ($exitCode === 0) {
-                $resultData = $this->parseResults($executionDir, $output);
+                // Parse results from OUTPUT directory (session dir if available)
+                $resultData = $this->parseResults($outputDir, $output);
+                
+                // Use session ID for file URLs if available, otherwise temp ID
+                $fileUrlId = $sessionId ? "session_{$sessionId}" : $tempId;
+                
                 return [
                     'success' => true,
                     'output' => $this->cleanOutput($output),
                     'error' => null,
                     'charts' => $resultData['charts'] ?? [],
                     'files' => $resultData['files'] ?? [],
-                    'execution_dir' => $executionDir,
+                    'execution_dir' => $outputDir,
+                    'execution_id' => $fileUrlId,
                 ];
             } else {
                 return [
@@ -73,7 +85,8 @@ class PythonExecutionService
                     'error' => $this->cleanOutput($output),
                     'charts' => [],
                     'files' => [],
-                    'execution_dir' => $executionDir,
+                    'execution_dir' => $outputDir,
+                    'execution_id' => $sessionId ? "session_{$sessionId}" : $tempId,
                 ];
             }
         } catch (\Symfony\Component\Process\Exception\ProcessTimedOutException $e) {
@@ -84,7 +97,7 @@ class PythonExecutionService
                 'error' => "Execution timed out after {$this->timeout} seconds",
                 'charts' => [],
                 'files' => [],
-                'execution_dir' => $executionDir,
+                'execution_dir' => $outputDir ?? $executionDir,
             ];
         } catch (\Exception $e) {
             Log::error('PythonExecutionService: Execution failed', [
@@ -97,7 +110,7 @@ class PythonExecutionService
                 'error' => $e->getMessage(),
                 'charts' => [],
                 'files' => [],
-                'execution_dir' => $executionDir ?? null,
+                'execution_dir' => $outputDir ?? $executionDir ?? null,
             ];
         }
     }
@@ -171,6 +184,19 @@ class PythonExecutionService
         return $dir;
     }
 
+    /**
+     * Get the output directory for a session (where charts/files are saved)
+     * This is separate from the pickle storage to keep things organized
+     */
+    protected function getSessionOutputDirectory(string $sessionId): string
+    {
+        $dir = "{$this->sessionsPath}/{$sessionId}/outputs";
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+        return $dir;
+    }
+
     protected function getOriginalDataFrameNames(int $fileCount): array
     {
         if ($fileCount === 0) {
@@ -198,12 +224,12 @@ class PythonExecutionService
     protected function prepareScript(
         string $code,
         array $dataFiles,
-        string $executionDir,
+        string $outputDir,
         ?string $sessionDir,
         array $originalDfNames
     ): string {
         // Always start with our complete setup
-        $setup = $this->getCompleteSetup($dataFiles, $executionDir, $sessionDir, $originalDfNames);
+        $setup = $this->getCompleteSetup($dataFiles, $outputDir, $sessionDir, $originalDfNames);
         
         // Remove any duplicate imports from user code to avoid conflicts
         $cleanedCode = $this->removeDuplicateImports($code);
@@ -224,20 +250,30 @@ class PythonExecutionService
      */
     protected function getCompleteSetup(
         array $dataFiles,
-        string $executionDir,
+        string $outputDir,
         ?string $sessionDir,
         array $originalDfNames
     ): string {
         $imports = $this->getStandardImports();
-        $outputDir = "OUTPUT_DIR = '{$executionDir}'";
+        $outputDirCode = "OUTPUT_DIR = '{$outputDir}'";
+        
+        // Change to output directory so files are saved there by default
+        $chdirCode = "os.chdir(OUTPUT_DIR)";
+        
         $fileLoading = $this->generateFileLoadingCode($dataFiles);
         $sessionRestore = $sessionDir ? $this->generateSessionRestoreCode($sessionDir, $originalDfNames) : '';
+        
+        // List existing files in output directory so AI knows what's available
+        $existingFilesCode = $this->generateExistingFilesCode($outputDir);
 
         return <<<PYTHON
 # ========== AUTO-GENERATED SETUP (DO NOT MODIFY) ==========
 {$imports}
 
-{$outputDir}
+{$outputDirCode}
+{$chdirCode}
+
+{$existingFilesCode}
 
 {$fileLoading}
 {$sessionRestore}
@@ -246,25 +282,46 @@ PYTHON;
     }
 
     /**
+     * Generate code that lists existing files in the output directory
+     * This helps the AI know what charts/files already exist from previous executions
+     */
+    protected function generateExistingFilesCode(string $outputDir): string
+    {
+        $files = [];
+        if (is_dir($outputDir)) {
+            foreach (scandir($outputDir) as $file) {
+                if ($file === '.' || $file === '..' || $file === '.gitkeep') continue;
+                if (pathinfo($file, PATHINFO_EXTENSION) === 'pkl') continue; // Skip pickle files
+                $files[] = $file;
+            }
+        }
+        
+        if (empty($files)) {
+            return "# No existing output files from previous executions\nEXISTING_FILES = []";
+        }
+        
+        $fileList = "'" . implode("', '", $files) . "'";
+        return <<<PYTHON
+# Files from previous executions (available for use):
+EXISTING_FILES = [{$fileList}]
+if EXISTING_FILES:
+    print(f"📁 Available files from previous steps: {', '.join(EXISTING_FILES)}")
+PYTHON;
+    }
+
+    /**
      * Remove common imports from user code since we provide them
-     * Uses specific patterns to avoid removing submodule imports we don't provide
      */
     protected function removeDuplicateImports(string $code): string
     {
         $lines = explode("\n", $code);
         $filteredLines = [];
         
-        // More specific patterns - only remove exact imports we provide
         $skipPatterns = [
-            // Pandas
             '/^import pandas\s*(as pd)?$/',
             '/^from pandas import/',
-            
-            // Numpy
             '/^import numpy\s*(as np)?$/',
             '/^from numpy import/',
-            
-            // Matplotlib - be specific about what we provide
             '/^import matplotlib$/',
             '/^import matplotlib\s*$/',
             '/^matplotlib\.use\s*\(/',
@@ -276,30 +333,28 @@ PYTHON;
             '/^from matplotlib\.patches import/',
             '/^import matplotlib\.patheffects/',
             '/^from matplotlib\.patheffects import/',
-            
-            // Seaborn
             '/^import seaborn\s*(as sns)?$/',
             '/^from seaborn import/',
-            
-            // Datetime
             '/^from datetime import/',
             '/^import datetime$/',
-            
-            // Warnings
             '/^import warnings$/',
             '/^warnings\.filterwarnings/',
-            
-            // Openpyxl - we provide these
             '/^import openpyxl/',
             '/^from openpyxl import/',
             '/^from openpyxl\./',
-            
-            // Reportlab - we provide these
-            '/^from reportlab/',
+            '/^from reportlab\.lib import/',
+            '/^from reportlab\.lib\.pagesizes import/',
+            '/^from reportlab\.lib\.styles import/',
+            '/^from reportlab\.lib\.units import/',
+            '/^from reportlab\.lib\.enums import/',
+            '/^from reportlab\.lib\.colors import/',
+            '/^from reportlab\.platypus import/',
+            '/^from reportlab\.pdfgen import/',
+            '/^from reportlab\.graphics/',
             '/^import reportlab/',
-            
-            // OS
             '/^import os$/',
+            '/^from io import/',
+            '/^import io$/',
         ];
         
         foreach ($lines as $line) {
@@ -318,7 +373,6 @@ PYTHON;
             }
         }
         
-        // Remove leading blank lines
         while (!empty($filteredLines) && trim($filteredLines[0]) === '') {
             array_shift($filteredLines);
         }
@@ -334,9 +388,10 @@ PYTHON;
         $originalDfList = "'" . implode("', '", $originalDfNames) . "'";
 
         return <<<PYTHON
-# Restore persisted variables from previous executions
+# Restore persisted DataFrames from previous executions
 _session_dir = '{$sessionDir}'
 _original_dfs = [{$originalDfList}]
+_restored_vars = []
 if os.path.exists(_session_dir):
     for _f in os.listdir(_session_dir):
         if _f.endswith('.pkl'):
@@ -344,8 +399,11 @@ if os.path.exists(_session_dir):
             if _var_name not in _original_dfs and not _var_name.startswith('_'):
                 try:
                     globals()[_var_name] = pd.read_pickle(os.path.join(_session_dir, _f))
+                    _restored_vars.append(_var_name)
                 except Exception:
                     pass
+if _restored_vars:
+    print(f"📊 Restored DataFrames from previous steps: {', '.join(_restored_vars)}")
 PYTHON;
     }
 
@@ -361,29 +419,32 @@ PYTHON;
 _session_dir = '{$sessionDir}'
 _original_dfs = [{$originalDfList}]
 os.makedirs(_session_dir, exist_ok=True)
+_saved_vars = []
 for _var_name in list(globals().keys()):
     if _var_name.startswith('_'):
         continue
     if _var_name in _original_dfs:
         continue
-    if _var_name in ['pd', 'np', 'plt', 'sns', 'os', 'datetime', 'timedelta', 'warnings', 'mpatches', 'patheffects']:
+    if _var_name in ['pd', 'np', 'plt', 'sns', 'os', 'datetime', 'timedelta', 'warnings', 'mpatches', 'patheffects', 'EXISTING_FILES', 'OUTPUT_DIR']:
         continue
     _obj = globals()[_var_name]
     if isinstance(_obj, pd.DataFrame):
         try:
             _obj.to_pickle(os.path.join(_session_dir, f'{_var_name}.pkl'))
+            _saved_vars.append(_var_name)
         except Exception:
             pass
 PYTHON;
     }
 
     /**
-     * Get standard Python imports - includes ALL commonly used matplotlib submodules
+     * Get standard Python imports
      */
     protected function getStandardImports(): string
     {
         return <<<'PYTHON'
 import os
+import io
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -414,14 +475,25 @@ try:
 except ImportError:
     pass
 
-# PDF support
+# PDF support - comprehensive imports including Flowable for custom elements
 try:
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import letter, A4, landscape
+    from reportlab.lib.colors import HexColor, Color
+    from reportlab.lib.pagesizes import letter, A4, landscape, portrait
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import inch, cm
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image, PageBreak
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    from reportlab.lib.units import inch, cm, mm
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
+    from reportlab.platypus import (
+        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, 
+        Image, PageBreak, Flowable, KeepTogether, ListFlowable, 
+        ListItem, HRFlowable, CondPageBreak, Frame, PageTemplate
+    )
+    from reportlab.platypus.doctemplate import BaseDocTemplate
+    from reportlab.pdfgen import canvas
+    from reportlab.graphics.shapes import Drawing, Rect, String, Line, Circle as DrawingCircle
+    from reportlab.graphics import renderPDF
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
 except ImportError:
     pass
 PYTHON;
@@ -438,12 +510,10 @@ PYTHON;
 
         $code = "# Load data files\n";
 
-        // First file is always 'df'
         $firstFile = array_shift($dataFiles);
         $path = $firstFile['path'] ?? $firstFile;
         $code .= "df = pd.read_csv('{$path}')\n";
 
-        // Additional files get named variables
         foreach ($dataFiles as $index => $file) {
             $varName = "df" . ($index + 2);
             $path = $file['path'] ?? $file;
@@ -458,7 +528,6 @@ PYTHON;
      */
     protected function cleanOutput(string $output): string
     {
-        // Remove lines that are clearly from our auto-generated code
         $lines = explode("\n", $output);
         $filtered = array_filter($lines, function ($line) {
             $trimmed = trim($line);
@@ -473,16 +542,20 @@ PYTHON;
     /**
      * Parse execution results to find generated files
      */
-    protected function parseResults(string $executionDir, string $output): array
+    protected function parseResults(string $outputDir, string $output): array
     {
         $results = [
             'charts' => [],
             'files' => [],
         ];
 
+        if (!is_dir($outputDir)) {
+            return $results;
+        }
+
         // Find image files
         foreach (['png', 'jpg', 'jpeg', 'svg'] as $ext) {
-            foreach (glob("{$executionDir}/*.{$ext}") as $file) {
+            foreach (glob("{$outputDir}/*.{$ext}") as $file) {
                 $filename = basename($file);
                 $results['charts'][] = [
                     'filename' => $filename,
@@ -495,7 +568,7 @@ PYTHON;
 
         // Find data/document files
         foreach (['csv', 'xlsx', 'xls', 'json', 'pdf'] as $ext) {
-            foreach (glob("{$executionDir}/*.{$ext}") as $file) {
+            foreach (glob("{$outputDir}/*.{$ext}") as $file) {
                 $filename = basename($file);
                 $results['files'][] = [
                     'filename' => $filename,
@@ -509,9 +582,20 @@ PYTHON;
         return $results;
     }
 
+    /**
+     * Get a generated file - supports both temp executions and session outputs
+     */
     public function getGeneratedFile($executionId, string $filename): ?string
     {
-        $path = "{$this->executionsPath}/{$executionId}/{$filename}";
+        // Check if it's a session-based ID
+        if (str_starts_with($executionId, 'session_')) {
+            $sessionId = substr($executionId, 8);
+            $path = "{$this->sessionsPath}/{$sessionId}/outputs/{$filename}";
+        } else {
+            // Legacy temp-based path
+            $path = "{$this->executionsPath}/{$executionId}/{$filename}";
+        }
+        
         return (file_exists($path) && is_file($path)) ? $path : null;
     }
 

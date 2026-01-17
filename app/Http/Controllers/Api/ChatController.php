@@ -48,39 +48,24 @@ class ChatController extends Controller
         $this->model = config('ai.default_model', 'claude-sonnet-4-20250514');
     }
 
-    /**
-     * Sanitize a string to ensure valid UTF-8 encoding
-     * This prevents "Malformed UTF-8 characters" errors when sending to APIs
-     */
     protected function sanitizeUtf8(?string $text): string
     {
         if ($text === null) {
             return '';
         }
-        
-        // Convert to UTF-8 if not already, replacing invalid sequences
         $text = mb_convert_encoding($text, 'UTF-8', 'UTF-8');
-        
-        // Remove any remaining invalid UTF-8 sequences
         $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', '', $text);
-        
-        // Ensure the string is valid UTF-8
         if (!mb_check_encoding($text, 'UTF-8')) {
             $text = mb_convert_encoding($text, 'UTF-8', 'ISO-8859-1');
         }
-        
         return $text;
     }
 
-    /**
-     * Truncate output to prevent massive payloads
-     */
     protected function truncateOutput(string $output, int $maxLength = 50000): string
     {
         if (strlen($output) <= $maxLength) {
             return $output;
         }
-        
         $truncated = substr($output, 0, $maxLength);
         return $truncated . "\n\n... [Output truncated - " . number_format(strlen($output) - $maxLength) . " characters omitted]";
     }
@@ -138,7 +123,8 @@ class ChatController extends Controller
 
     public function previewFile(Request $request, string $executionId, string $filename): BinaryFileResponse|JsonResponse
     {
-        if (!preg_match('/^temp_[a-zA-Z0-9]{16}$/', $executionId)) {
+        // Support both session-based and temp-based execution IDs
+        if (!preg_match('/^(session_\d+|temp_[a-zA-Z0-9]{16})$/', $executionId)) {
             return response()->json(['message' => 'Invalid execution ID'], 400);
         }
 
@@ -171,7 +157,8 @@ class ChatController extends Controller
 
     public function downloadFile(Request $request, string $executionId, string $filename): BinaryFileResponse|JsonResponse
     {
-        if (!preg_match('/^temp_[a-zA-Z0-9]{16}$/', $executionId)) {
+        // Support both session-based and temp-based execution IDs
+        if (!preg_match('/^(session_\d+|temp_[a-zA-Z0-9]{16})$/', $executionId)) {
             return response()->json(['message' => 'Invalid execution ID'], 400);
         }
 
@@ -391,8 +378,11 @@ class ChatController extends Controller
 
                                 $execResult = $this->pythonService->executeCode($pythonCode, $dataFilePaths, (string) $conversation->id);
                                 
-                                $executionId = null;
-                                if (!empty($execResult['execution_dir'])) {
+                                // Use the execution_id from the result (handles both session and temp)
+                                $executionId = $execResult['execution_id'] ?? null;
+                                
+                                // Fallback to basename if execution_id not set (legacy support)
+                                if (!$executionId && !empty($execResult['execution_dir'])) {
                                     $executionId = basename($execResult['execution_dir']);
                                 }
 
@@ -424,7 +414,6 @@ class ChatController extends Controller
                                     ];
                                 }, $execResult['files'] ?? []);
 
-                                // Sanitize and truncate output
                                 $cleanOutput = $this->sanitizeUtf8($execResult['output'] ?? '');
                                 $cleanOutput = $this->truncateOutput($cleanOutput);
                                 $cleanError = $this->sanitizeUtf8($execResult['error'] ?? '');
@@ -453,10 +442,8 @@ class ChatController extends Controller
                                     $resultText .= "\n\nGenerated files: " . implode(', ', array_column($filesWithUrls, 'filename'));
                                 }
 
-                                // Truncate result text for context to avoid bloating
                                 $resultText = $this->truncateOutput($resultText, 30000);
 
-                                // Add assistant's message (might be empty if it just called a tool)
                                 $assistantText = $this->sanitizeUtf8($responseText) ?: 'Running analysis...';
                                 $prismMessages[] = new AssistantMessage($assistantText);
                                 $prismMessages[] = new UserMessage("Tool execution result:\n\n" . $resultText);
@@ -465,7 +452,6 @@ class ChatController extends Controller
                         continue;
                     }
 
-                    // No tool calls - this is the final response
                     $finalContent = $this->sanitizeUtf8($responseText);
                     
                     Log::info('Final response received', ['length' => strlen($finalContent)]);
@@ -481,7 +467,6 @@ class ChatController extends Controller
                     break;
                 }
 
-                // If we hit max steps but had tool calls, force a final summary
                 if ($stepsTaken >= $maxSteps && $hadToolCalls && empty($finalContent)) {
                     Log::warning('Hit max steps, requesting final summary');
                     
@@ -506,7 +491,6 @@ class ChatController extends Controller
                     }
                 }
 
-                // If still no content, provide a default message
                 if (empty($finalContent) && !empty($executionResults)) {
                     $finalContent = "I've completed the analysis. You can see the execution results above, including any generated charts and files.";
                     
@@ -631,7 +615,6 @@ class ChatController extends Controller
                 if (file_exists($fullPath) && ($handle = fopen($fullPath, 'r'))) {
                     $preview = [];
                     for ($j = 0; $j < 4 && ($line = fgets($handle)); $j++) {
-                        // Sanitize preview lines for UTF-8
                         $preview[] = $this->sanitizeUtf8(rtrim($line));
                     }
                     fclose($handle);
@@ -651,7 +634,6 @@ class ChatController extends Controller
     {
         $result = [];
         foreach ($msgs as $m) {
-            // Ensure content is sanitized
             $content = $this->sanitizeUtf8($m['content'] ?? '');
             
             if ($m['role'] === 'assistant') {

@@ -41,10 +41,11 @@ Route::middleware(['web', 'auth'])->group(function () {
     Route::post('/chat/conversations/{conversation}/messages/stream', [ChatController::class, 'streamMessage']);
     
     // Chat Execution Files (for AI-generated files)
+    // Supports both temp_XXX (legacy) and session_XXX (persistent) formats
     Route::get('/chat/executions/{executionId}/files/{filename}', [ChatController::class, 'previewFile'])
-        ->where('executionId', 'temp_[a-zA-Z0-9]+');
+        ->where('executionId', '(temp_[a-zA-Z0-9]+|session_[0-9]+)');
     Route::get('/chat/executions/{executionId}/files/{filename}/download', [ChatController::class, 'downloadFile'])
-        ->where('executionId', 'temp_[a-zA-Z0-9]+');
+        ->where('executionId', '(temp_[a-zA-Z0-9]+|session_[0-9]+)');
 
     // Script Executions
     Route::get('/executions', [ExecutionController::class, 'index']);
