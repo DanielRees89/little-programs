@@ -356,7 +356,43 @@ function FileChip({ file }) {
 
 function formatTime(ts) {
     if (!ts) return '';
-    return new Date(ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+
+    const date = new Date(ts);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffSec = Math.floor(diffMs / 1000);
+    const diffMin = Math.floor(diffSec / 60);
+    const diffHour = Math.floor(diffMin / 60);
+    const diffDay = Math.floor(diffHour / 24);
+
+    // Less than 1 minute ago
+    if (diffSec < 60) {
+        return 'Just now';
+    }
+
+    // Less than 1 hour ago
+    if (diffMin < 60) {
+        return `${diffMin} min${diffMin === 1 ? '' : 's'} ago`;
+    }
+
+    // Less than 24 hours ago
+    if (diffHour < 24) {
+        return `${diffHour} hour${diffHour === 1 ? '' : 's'} ago`;
+    }
+
+    // Less than 7 days ago
+    if (diffDay < 7) {
+        return `${diffDay} day${diffDay === 1 ? '' : 's'} ago`;
+    }
+
+    // Otherwise show date and time
+    return date.toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+    });
 }
 
 function formatFileSize(bytes) {

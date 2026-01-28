@@ -24,6 +24,16 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
     const [streamingExecutions, setStreamingExecutions] = useState([]);
     
     const messagesEndRef = useRef(null);
+    const abortControllerRef = useRef(null);
+
+    // Cleanup abort controller on unmount
+    useEffect(() => {
+        return () => {
+            if (abortControllerRef.current) {
+                abortControllerRef.current.abort();
+            }
+        };
+    }, []);
 
     // Load conversation from URL or initial prop
     useEffect(() => {
@@ -172,9 +182,18 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
     };
 
     const sendStreamingMessage = async (conversationId, content, fileIds, tempUserMessageId) => {
+        // Cancel any existing stream
+        if (abortControllerRef.current) {
+            abortControllerRef.current.abort();
+        }
+
+        // Create new abort controller for this request
+        abortControllerRef.current = new AbortController();
+        const { signal } = abortControllerRef.current;
+
         return new Promise((resolve, reject) => {
             const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
-            
+
             fetch(`/api/chat/conversations/${conversationId}/messages/stream`, {
                 method: 'POST',
                 headers: {
@@ -183,6 +202,7 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                     'X-CSRF-TOKEN': csrfToken,
                 },
                 credentials: 'same-origin',
+                signal, // Add abort signal
                 body: JSON.stringify({
                     message: content,
                     file_ids: fileIds.length > 0 ? fileIds : undefined,
@@ -362,6 +382,11 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
 
                 processStream();
             }).catch(error => {
+                // Don't treat abort as an error
+                if (error.name === 'AbortError') {
+                    resolve(); // Resolve gracefully on abort
+                    return;
+                }
                 setIsLoading(false);
                 setLoadingStatus('');
                 setStreamingMessage(null);
