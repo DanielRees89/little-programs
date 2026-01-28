@@ -29,7 +29,7 @@ const ActionTypes = {
     ADD_MESSAGE: 'ADD_MESSAGE',
     UPDATE_MESSAGE: 'UPDATE_MESSAGE',
     REMOVE_MESSAGE: 'REMOVE_MESSAGE',
-    FINALIZE_MESSAGES: 'FINALIZE_MESSAGES',
+    FINALIZE_AND_RESET: 'FINALIZE_AND_RESET', // Combined action for atomic update
     SET_LOADING: 'SET_LOADING',
     SET_ERROR: 'SET_ERROR',
     CLEAR_ERROR: 'CLEAR_ERROR',
@@ -72,12 +72,21 @@ function chatReducer(state, action) {
                 messages: state.messages.filter(m => m.id !== action.payload),
             };
 
-        case ActionTypes.FINALIZE_MESSAGES: {
+        // Combined action: finalize messages AND reset streaming in ONE atomic update
+        // This prevents the brief moment where both streaming message and finalized message appear
+        case ActionTypes.FINALIZE_AND_RESET: {
             const { tempId, userMessage, assistantMessage } = action.payload;
             const filtered = state.messages.filter(m => m.id !== tempId);
             return {
                 ...state,
                 messages: [...filtered, userMessage, assistantMessage],
+                // Reset streaming in the same update
+                streaming: {
+                    message: null,
+                    thinking: '',
+                    content: '',
+                    executions: [],
+                },
             };
         }
 
@@ -370,7 +379,7 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
             }
 
             dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Thinking...' } });
-            await sendStreamingMessage(conv.id, content, fileIds, userMessage.id);
+            await sendStreamingMessage(conv.id, content, fileIds, userMessage);
             router.reload({ only: ['chatConversations'] });
         } catch (err) {
             console.error('Error sending message:', err);
@@ -378,10 +387,11 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
             dispatch({ type: ActionTypes.RESET_STREAMING });
             dispatch({ type: ActionTypes.SET_ERROR, payload: err.message || 'Failed to get response' });
             dispatch({ type: ActionTypes.REMOVE_MESSAGE, payload: userMessage.id });
+            return;
         }
     }, [conversation]);
 
-    const sendStreamingMessage = async (conversationId, content, fileIds, tempUserMessageId) => {
+    const sendStreamingMessage = async (conversationId, content, fileIds, tempUserMessage) => {
         // Cancel any existing stream
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
@@ -559,19 +569,21 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                             dispatch({ type: ActionTypes.SET_RESULTS, payload: message.metadata.execution_results });
                         }
 
+                        // Use combined action for atomic state update
+                        // This prevents the double message issue where both streaming
+                        // message and finalized message appear simultaneously
                         dispatch({
-                            type: ActionTypes.FINALIZE_MESSAGES,
+                            type: ActionTypes.FINALIZE_AND_RESET,
                             payload: {
-                                tempId: tempUserMessageId,
+                                tempId: tempUserMessage.id,
                                 userMessage: {
-                                    ...messages.find(m => m.id === tempUserMessageId),
+                                    ...tempUserMessage,
                                     id: `user-${Date.now()}`,
                                 },
                                 assistantMessage: message,
                             },
                         });
 
-                        dispatch({ type: ActionTypes.RESET_STREAMING });
                         resolve();
                     }
                 };
@@ -726,11 +738,16 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                                         />
                                     )}
 
+                                    {/* Show LoadingIndicator before streaming starts */}
                                     {loading.isLoading && !displayStreamingMessage && (
                                         <LoadingIndicator status={loading.status} />
                                     )}
 
-                                    {loading.isLoading && displayStreamingMessage && loading.status && (
+                                    {/* Show status indicator ONLY when streaming has some content
+                                        (not during initial "Thinking..." phase - ChatMessage handles that) */}
+                                    {loading.isLoading && displayStreamingMessage && loading.status &&
+                                     (displayStreamingMessage.content || displayStreamingMessage.thinking ||
+                                      displayStreamingMessage.metadata?.execution_results?.length > 0) && (
                                         <div className="flex items-center gap-2 text-sm text-paper-500 ml-12">
                                             <div className="w-4 h-4 border-2 border-punch-200 border-t-punch-500 rounded-full animate-spin" />
                                             {loading.status}
