@@ -1,30 +1,233 @@
-import { useState, useRef, useEffect } from 'react';
+import { useReducer, useRef, useEffect, useCallback } from 'react';
 import { Head, router, usePage } from '@inertiajs/react';
 import AppLayout from '@/Layouts/AppLayout';
 import { EmptyState } from '@/Components/UI';
 import { ChatMessage, ChatInput, SaveScriptModal, ResultsPanel } from '@/Components/Chat';
 
+// ============================================================================
+// State Management with useReducer
+// ============================================================================
+
+const initialState = {
+    conversation: null,
+    messages: [],
+    loading: { isLoading: false, status: '' },
+    error: null,
+    saveModal: { isOpen: false, code: '', language: 'python' },
+    results: { show: false, items: [] },
+    streaming: {
+        message: null,
+        thinking: '',
+        content: '',
+        executions: [],
+    },
+};
+
+const ActionTypes = {
+    SET_CONVERSATION: 'SET_CONVERSATION',
+    SET_MESSAGES: 'SET_MESSAGES',
+    ADD_MESSAGE: 'ADD_MESSAGE',
+    UPDATE_MESSAGE: 'UPDATE_MESSAGE',
+    REMOVE_MESSAGE: 'REMOVE_MESSAGE',
+    FINALIZE_MESSAGES: 'FINALIZE_MESSAGES',
+    SET_LOADING: 'SET_LOADING',
+    SET_ERROR: 'SET_ERROR',
+    CLEAR_ERROR: 'CLEAR_ERROR',
+    OPEN_SAVE_MODAL: 'OPEN_SAVE_MODAL',
+    CLOSE_SAVE_MODAL: 'CLOSE_SAVE_MODAL',
+    SET_RESULTS: 'SET_RESULTS',
+    SHOW_RESULTS: 'SHOW_RESULTS',
+    HIDE_RESULTS: 'HIDE_RESULTS',
+    START_STREAMING: 'START_STREAMING',
+    UPDATE_STREAMING_THINKING: 'UPDATE_STREAMING_THINKING',
+    UPDATE_STREAMING_CONTENT: 'UPDATE_STREAMING_CONTENT',
+    ADD_STREAMING_EXECUTION: 'ADD_STREAMING_EXECUTION',
+    UPDATE_STREAMING_EXECUTION: 'UPDATE_STREAMING_EXECUTION',
+    RESET_STREAMING: 'RESET_STREAMING',
+    LOAD_CONVERSATION: 'LOAD_CONVERSATION',
+};
+
+function chatReducer(state, action) {
+    switch (action.type) {
+        case ActionTypes.SET_CONVERSATION:
+            return { ...state, conversation: action.payload };
+
+        case ActionTypes.SET_MESSAGES:
+            return { ...state, messages: action.payload };
+
+        case ActionTypes.ADD_MESSAGE:
+            return { ...state, messages: [...state.messages, action.payload] };
+
+        case ActionTypes.UPDATE_MESSAGE:
+            return {
+                ...state,
+                messages: state.messages.map(m =>
+                    m.id === action.payload.id ? { ...m, ...action.payload.updates } : m
+                ),
+            };
+
+        case ActionTypes.REMOVE_MESSAGE:
+            return {
+                ...state,
+                messages: state.messages.filter(m => m.id !== action.payload),
+            };
+
+        case ActionTypes.FINALIZE_MESSAGES: {
+            const { tempId, userMessage, assistantMessage } = action.payload;
+            const filtered = state.messages.filter(m => m.id !== tempId);
+            return {
+                ...state,
+                messages: [...filtered, userMessage, assistantMessage],
+            };
+        }
+
+        case ActionTypes.SET_LOADING:
+            return {
+                ...state,
+                loading: { ...state.loading, ...action.payload },
+            };
+
+        case ActionTypes.SET_ERROR:
+            return { ...state, error: action.payload };
+
+        case ActionTypes.CLEAR_ERROR:
+            return { ...state, error: null };
+
+        case ActionTypes.OPEN_SAVE_MODAL:
+            return {
+                ...state,
+                saveModal: { isOpen: true, ...action.payload },
+            };
+
+        case ActionTypes.CLOSE_SAVE_MODAL:
+            return {
+                ...state,
+                saveModal: { isOpen: false, code: '', language: 'python' },
+            };
+
+        case ActionTypes.SET_RESULTS:
+            return {
+                ...state,
+                results: { ...state.results, items: action.payload },
+            };
+
+        case ActionTypes.SHOW_RESULTS:
+            return {
+                ...state,
+                results: { ...state.results, show: true },
+            };
+
+        case ActionTypes.HIDE_RESULTS:
+            return {
+                ...state,
+                results: { ...state.results, show: false },
+            };
+
+        case ActionTypes.START_STREAMING:
+            return {
+                ...state,
+                streaming: {
+                    message: action.payload,
+                    thinking: '',
+                    content: '',
+                    executions: [],
+                },
+            };
+
+        case ActionTypes.UPDATE_STREAMING_THINKING:
+            return {
+                ...state,
+                streaming: { ...state.streaming, thinking: action.payload },
+            };
+
+        case ActionTypes.UPDATE_STREAMING_CONTENT:
+            return {
+                ...state,
+                streaming: {
+                    ...state.streaming,
+                    content: state.streaming.content + action.payload,
+                },
+            };
+
+        case ActionTypes.ADD_STREAMING_EXECUTION:
+            return {
+                ...state,
+                streaming: {
+                    ...state.streaming,
+                    executions: [...state.streaming.executions, action.payload],
+                },
+            };
+
+        case ActionTypes.UPDATE_STREAMING_EXECUTION: {
+            const executions = [...state.streaming.executions];
+            const lastIdx = executions.length - 1;
+            if (lastIdx >= 0) {
+                executions[lastIdx] = { ...executions[lastIdx], ...action.payload };
+            }
+            return {
+                ...state,
+                streaming: { ...state.streaming, executions },
+                results: {
+                    ...state.results,
+                    items: executions.filter(e => e.status === 'complete'),
+                },
+            };
+        }
+
+        case ActionTypes.RESET_STREAMING:
+            return {
+                ...state,
+                streaming: {
+                    message: null,
+                    thinking: '',
+                    content: '',
+                    executions: [],
+                },
+            };
+
+        case ActionTypes.LOAD_CONVERSATION:
+            return {
+                ...state,
+                conversation: action.payload.conversation,
+                messages: [],
+                error: null,
+                streaming: initialState.streaming,
+                results: { show: false, items: [] },
+            };
+
+        default:
+            return state;
+    }
+}
+
+// ============================================================================
+// Main Component
+// ============================================================================
+
 export default function ChatIndex({ conversation: initialConversation = null }) {
     const { chatConversations } = usePage().props;
-    const [currentConversation, setCurrentConversation] = useState(initialConversation);
-    const [messages, setMessages] = useState([]);
-    const [isLoading, setIsLoading] = useState(false);
-    const [loadingStatus, setLoadingStatus] = useState('');
-    const [error, setError] = useState(null);
-    const [saveModal, setSaveModal] = useState({ isOpen: false, code: '', language: 'python' });
-    
-    // Results panel state
-    const [showResults, setShowResults] = useState(false);
-    const [currentResults, setCurrentResults] = useState([]);
-    
-    // Streaming state
-    const [streamingMessage, setStreamingMessage] = useState(null);
-    const [streamingThinking, setStreamingThinking] = useState('');
-    const [streamingContent, setStreamingContent] = useState('');
-    const [streamingExecutions, setStreamingExecutions] = useState([]);
-    
+    const [state, dispatch] = useReducer(chatReducer, {
+        ...initialState,
+        conversation: initialConversation,
+    });
+
     const messagesEndRef = useRef(null);
     const abortControllerRef = useRef(null);
+
+    // Destructure state for easier access
+    const {
+        conversation,
+        messages,
+        loading,
+        error,
+        saveModal,
+        results,
+        streaming,
+    } = state;
+
+    // ========================================================================
+    // Effects
+    // ========================================================================
 
     // Cleanup abort controller on unmount
     useEffect(() => {
@@ -45,19 +248,23 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
     // Auto-scroll to bottom when new messages arrive
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [messages, isLoading, streamingContent, streamingThinking, streamingExecutions]);
+    }, [messages, loading.isLoading, streaming.content, streaming.thinking, streaming.executions]);
 
     // Open results panel when we get results with files
     useEffect(() => {
-        if (currentResults.length > 0) {
-            const hasFiles = currentResults.some(r => 
+        if (results.items.length > 0) {
+            const hasFiles = results.items.some(r =>
                 (r.charts && r.charts.length > 0) || (r.files && r.files.length > 0)
             );
             if (hasFiles) {
-                setShowResults(true);
+                dispatch({ type: ActionTypes.SHOW_RESULTS });
             }
         }
-    }, [currentResults]);
+    }, [results.items]);
+
+    // ========================================================================
+    // API Functions
+    // ========================================================================
 
     const createConversation = async () => {
         try {
@@ -74,15 +281,12 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
             if (!response.ok) throw new Error('Failed to create conversation');
 
             const data = await response.json();
-            setCurrentConversation(data.conversation);
-            
-            // Refresh the page to update sidebar conversations
+            dispatch({ type: ActionTypes.SET_CONVERSATION, payload: data.conversation });
             router.reload({ only: ['chatConversations'] });
-            
             return data.conversation;
         } catch (err) {
             console.error('Error creating conversation:', err);
-            setError('Failed to start conversation');
+            dispatch({ type: ActionTypes.SET_ERROR, payload: 'Failed to start conversation' });
             return null;
         }
     };
@@ -109,13 +313,46 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
         return (await response.json()).file;
     };
 
-    const handleSend = async (content, attachedFiles = []) => {
-        setError(null);
+    const loadConversation = async (conv) => {
+        dispatch({ type: ActionTypes.LOAD_CONVERSATION, payload: { conversation: conv } });
 
-        let conversation = currentConversation;
-        if (!conversation) {
-            conversation = await createConversation();
-            if (!conversation) return;
+        try {
+            const response = await fetch(`/api/chat/conversations/${conv.id}`, {
+                headers: {
+                    'Accept': 'application/json',
+                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content,
+                },
+                credentials: 'same-origin',
+            });
+
+            if (!response.ok) throw new Error('Failed to load conversation');
+
+            const data = await response.json();
+            dispatch({ type: ActionTypes.SET_MESSAGES, payload: data.messages || [] });
+
+            const lastAgenticMessage = [...(data.messages || [])].reverse().find(m =>
+                m.role === 'assistant' && m.metadata?.execution_results?.length > 0
+            );
+            if (lastAgenticMessage?.metadata?.execution_results) {
+                dispatch({ type: ActionTypes.SET_RESULTS, payload: lastAgenticMessage.metadata.execution_results });
+            }
+        } catch (err) {
+            console.error('Error loading conversation:', err);
+            dispatch({ type: ActionTypes.SET_ERROR, payload: 'Failed to load conversation' });
+        }
+    };
+
+    // ========================================================================
+    // Event Handlers
+    // ========================================================================
+
+    const handleSend = useCallback(async (content, attachedFiles = []) => {
+        dispatch({ type: ActionTypes.CLEAR_ERROR });
+
+        let conv = conversation;
+        if (!conv) {
+            conv = await createConversation();
+            if (!conv) return;
         }
 
         const userMessage = {
@@ -124,62 +361,53 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
             content,
             created_at: new Date().toISOString(),
             metadata: attachedFiles.length > 0 ? {
-                attached_files: attachedFiles.map(f => ({ 
+                attached_files: attachedFiles.map(f => ({
                     name: f.name,
                     size: f.size,
-                    type: f.type 
-                }))
+                    type: f.type,
+                })),
             } : null,
         };
-        setMessages(prev => [...prev, userMessage]);
-        setIsLoading(true);
-        setLoadingStatus('');
-        
-        // Reset all streaming state
-        setStreamingMessage(null);
-        setStreamingThinking('');
-        setStreamingContent('');
-        setStreamingExecutions([]);
+
+        dispatch({ type: ActionTypes.ADD_MESSAGE, payload: userMessage });
+        dispatch({ type: ActionTypes.SET_LOADING, payload: { isLoading: true, status: '' } });
+        dispatch({ type: ActionTypes.RESET_STREAMING });
 
         try {
             let fileIds = [];
-            let uploadedFileInfo = [];
             if (attachedFiles.length > 0) {
-                setLoadingStatus('Uploading files...');
-                const uploadPromises = attachedFiles.map(file => uploadFile(file));
-                const uploadedFiles = await Promise.all(uploadPromises);
+                dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Uploading files...' } });
+                const uploadedFiles = await Promise.all(attachedFiles.map(uploadFile));
                 fileIds = uploadedFiles.map(f => f.id);
-                uploadedFileInfo = uploadedFiles.map(f => ({
-                    id: f.id,
-                    name: f.name,
-                    size: f.size,
-                }));
+
+                dispatch({
+                    type: ActionTypes.UPDATE_MESSAGE,
+                    payload: {
+                        id: userMessage.id,
+                        updates: {
+                            metadata: {
+                                attached_files: uploadedFiles.map(f => ({
+                                    id: f.id,
+                                    name: f.name,
+                                    size: f.size,
+                                })),
+                            },
+                        },
+                    },
+                });
             }
 
-            if (uploadedFileInfo.length > 0) {
-                setMessages(prev => prev.map(m => 
-                    m.id === userMessage.id 
-                        ? { ...m, metadata: { attached_files: uploadedFileInfo } }
-                        : m
-                ));
-            }
-
-            setLoadingStatus('Thinking...');
-            await sendStreamingMessage(conversation.id, content, fileIds, userMessage.id);
-
-            // Refresh sidebar conversations after message sent
+            dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Thinking...' } });
+            await sendStreamingMessage(conv.id, content, fileIds, userMessage.id);
             router.reload({ only: ['chatConversations'] });
-
         } catch (err) {
             console.error('Error sending message:', err);
-            setIsLoading(false);
-            setLoadingStatus('');
-            setStreamingMessage(null);
-            setStreamingExecutions([]);
-            setError(err.message || 'Failed to get response');
-            setMessages(prev => prev.filter(m => m.id !== userMessage.id));
+            dispatch({ type: ActionTypes.SET_LOADING, payload: { isLoading: false, status: '' } });
+            dispatch({ type: ActionTypes.RESET_STREAMING });
+            dispatch({ type: ActionTypes.SET_ERROR, payload: err.message || 'Failed to get response' });
+            dispatch({ type: ActionTypes.REMOVE_MESSAGE, payload: userMessage.id });
         }
-    };
+    }, [conversation]);
 
     const sendStreamingMessage = async (conversationId, content, fileIds, tempUserMessageId) => {
         // Cancel any existing stream
@@ -187,7 +415,6 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
             abortControllerRef.current.abort();
         }
 
-        // Create new abort controller for this request
         abortControllerRef.current = new AbortController();
         const { signal } = abortControllerRef.current;
 
@@ -202,7 +429,7 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                     'X-CSRF-TOKEN': csrfToken,
                 },
                 credentials: 'same-origin',
-                signal, // Add abort signal
+                signal,
                 body: JSON.stringify({
                     message: content,
                     file_ids: fileIds.length > 0 ? fileIds : undefined,
@@ -215,7 +442,7 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
 
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
-                
+
                 let currentThinking = '';
                 let currentContent = '';
                 let currentExecutions = [];
@@ -223,64 +450,60 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                 let finalMessage = null;
 
                 const streamingMsgId = `streaming-${Date.now()}`;
-                setStreamingMessage({
-                    id: streamingMsgId,
-                    role: 'assistant',
-                    content: '',
-                    thinking: '',
-                    created_at: new Date().toISOString(),
+                dispatch({
+                    type: ActionTypes.START_STREAMING,
+                    payload: {
+                        id: streamingMsgId,
+                        role: 'assistant',
+                        content: '',
+                        thinking: '',
+                        created_at: new Date().toISOString(),
+                    },
                 });
 
                 const processEvent = (eventType, data) => {
                     switch (eventType) {
                         case 'thinking':
                             currentThinking = data.full || data.content || '';
-                            setStreamingThinking(currentThinking);
-                            setLoadingStatus('Thinking...');
+                            dispatch({ type: ActionTypes.UPDATE_STREAMING_THINKING, payload: currentThinking });
+                            dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Thinking...' } });
                             break;
 
                         case 'tool_call':
-                            setLoadingStatus(`Running Python (step ${data.step || 1})...`);
-                            currentExecutions = [
-                                ...currentExecutions,
-                                {
-                                    code: data.code,
-                                    status: 'running',
-                                    step: data.step,
-                                }
-                            ];
-                            setStreamingExecutions([...currentExecutions]);
+                            dispatch({ type: ActionTypes.SET_LOADING, payload: { status: `Running Python (step ${data.step || 1})...` } });
+                            const newExec = { code: data.code, status: 'running', step: data.step };
+                            currentExecutions = [...currentExecutions, newExec];
+                            dispatch({ type: ActionTypes.ADD_STREAMING_EXECUTION, payload: newExec });
                             break;
 
                         case 'tool_result':
+                            const execUpdate = {
+                                status: 'complete',
+                                success: data.success,
+                                output: data.output,
+                                error: data.error,
+                                charts: data.charts || [],
+                                files: data.files || [],
+                                execution_id: data.execution_id,
+                            };
                             const lastIdx = currentExecutions.length - 1;
                             if (lastIdx >= 0) {
-                                currentExecutions[lastIdx] = {
-                                    ...currentExecutions[lastIdx],
-                                    status: 'complete',
-                                    success: data.success,
-                                    output: data.output,
-                                    error: data.error,
-                                    charts: data.charts || [],
-                                    files: data.files || [],
-                                    execution_id: data.execution_id,
-                                };
-                                setStreamingExecutions([...currentExecutions]);
-                                setCurrentResults([...currentExecutions.filter(e => e.status === 'complete')]);
+                                currentExecutions[lastIdx] = { ...currentExecutions[lastIdx], ...execUpdate };
                             }
-                            
+                            dispatch({ type: ActionTypes.UPDATE_STREAMING_EXECUTION, payload: execUpdate });
+
                             if (data.success) {
-                                setLoadingStatus('Code executed successfully');
+                                dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Code executed successfully' } });
                             } else {
-                                setLoadingStatus('Code failed, AI is fixing...');
+                                dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Code failed, AI is fixing...' } });
                             }
                             break;
 
                         case 'text_delta':
                             const delta = data.delta || '';
                             currentContent += delta;
-                            setStreamingContent(currentContent);
-                            setLoadingStatus('');
+                            dispatch({ type: ActionTypes.UPDATE_STREAMING_CONTENT, payload: delta });
+                            dispatch({ type: ActionTypes.SET_LOADING, payload: { status: '' } });
                             break;
 
                         case 'complete':
@@ -300,11 +523,11 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                         buffer = line.slice(6).trim();
                         return;
                     }
-                    
+
                     if (line.startsWith('data:')) {
                         const jsonStr = line.slice(5).trim();
                         if (!jsonStr || jsonStr === '[DONE]') return;
-                        
+
                         try {
                             const data = JSON.parse(jsonStr);
                             const eventType = buffer || data.type || 'unknown';
@@ -320,30 +543,28 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
 
                 const processStream = async () => {
                     let lineBuffer = '';
-                    
+
                     try {
                         while (true) {
                             const { done, value } = await reader.read();
                             if (done) break;
-                            
+
                             lineBuffer += decoder.decode(value, { stream: true });
                             const lines = lineBuffer.split('\n');
                             lineBuffer = lines.pop() || '';
-                            
+
                             for (const line of lines) {
                                 const trimmed = line.trim();
                                 if (trimmed) processLine(trimmed);
                             }
                         }
-                        
+
                         if (lineBuffer.trim()) {
                             processLine(lineBuffer.trim());
                         }
-                        
                     } finally {
-                        setIsLoading(false);
-                        setLoadingStatus('');
-                        
+                        dispatch({ type: ActionTypes.SET_LOADING, payload: { isLoading: false, status: '' } });
+
                         const message = finalMessage || {
                             id: streamingMsgId,
                             role: 'assistant',
@@ -357,51 +578,49 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                                 had_tool_calls: currentExecutions.length > 0,
                             },
                         };
-                        
+
                         if (message.metadata?.execution_results) {
-                            setCurrentResults(message.metadata.execution_results);
+                            dispatch({ type: ActionTypes.SET_RESULTS, payload: message.metadata.execution_results });
                         }
-                        
-                        setMessages(prev => {
-                            const filtered = prev.filter(m => m.id !== tempUserMessageId);
-                            const realUserMessage = {
-                                ...prev.find(m => m.id === tempUserMessageId),
-                                id: `user-${Date.now()}`,
-                            };
-                            return [...filtered, realUserMessage, message];
+
+                        dispatch({
+                            type: ActionTypes.FINALIZE_MESSAGES,
+                            payload: {
+                                tempId: tempUserMessageId,
+                                userMessage: {
+                                    ...messages.find(m => m.id === tempUserMessageId),
+                                    id: `user-${Date.now()}`,
+                                },
+                                assistantMessage: message,
+                            },
                         });
-                        
-                        setStreamingMessage(null);
-                        setStreamingThinking('');
-                        setStreamingContent('');
-                        setStreamingExecutions([]);
-                        
+
+                        dispatch({ type: ActionTypes.RESET_STREAMING });
                         resolve();
                     }
                 };
 
                 processStream();
             }).catch(error => {
-                // Don't treat abort as an error
                 if (error.name === 'AbortError') {
-                    resolve(); // Resolve gracefully on abort
+                    resolve();
                     return;
                 }
-                setIsLoading(false);
-                setLoadingStatus('');
-                setStreamingMessage(null);
-                setStreamingExecutions([]);
+                dispatch({ type: ActionTypes.SET_LOADING, payload: { isLoading: false, status: '' } });
+                dispatch({ type: ActionTypes.RESET_STREAMING });
                 reject(error);
             });
         });
     };
 
     const extractCode = (content) => {
-        const match = content.match(/```python\n([\s\S]*?)```/);
-        return match ? match[1].trim() : null;
+        // Extract all Python code blocks, not just the first one
+        const matches = content.matchAll(/```python\n([\s\S]*?)```/g);
+        const codeBlocks = Array.from(matches).map(m => m[1].trim());
+        return codeBlocks.length > 0 ? codeBlocks.join('\n\n# ---\n\n') : null;
     };
 
-    const handleSaveScript = (message) => {
+    const handleSaveScript = useCallback((message) => {
         let code = message.code;
         if (!code && message.metadata?.execution_results?.length > 0) {
             const lastSuccess = [...message.metadata.execution_results]
@@ -409,15 +628,14 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                 .find(e => e.success);
             code = lastSuccess?.code;
         }
-        
+
         if (code) {
-            setSaveModal({
-                isOpen: true,
-                code: code,
-                language: message.language || 'python',
+            dispatch({
+                type: ActionTypes.OPEN_SAVE_MODAL,
+                payload: { code, language: message.language || 'python' },
             });
         }
-    };
+    }, []);
 
     const handleSaveToLibrary = async (scriptData) => {
         try {
@@ -437,46 +655,21 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                 throw new Error(data.message || 'Failed to save script');
             }
 
-            setSaveModal({ isOpen: false, code: '', language: 'python' });
+            dispatch({ type: ActionTypes.CLOSE_SAVE_MODAL });
         } catch (err) {
             console.error('Error saving script:', err);
             throw err;
         }
     };
 
-    const loadConversation = async (conversation) => {
-        setCurrentConversation(conversation);
-        setMessages([]);
-        setError(null);
-        setStreamingMessage(null);
-        setStreamingExecutions([]);
-        setCurrentResults([]);
+    const handleViewResults = useCallback((executionResults) => {
+        dispatch({ type: ActionTypes.SET_RESULTS, payload: executionResults });
+        dispatch({ type: ActionTypes.SHOW_RESULTS });
+    }, []);
 
-        try {
-            const response = await fetch(`/api/chat/conversations/${conversation.id}`, {
-                headers: {
-                    'Accept': 'application/json',
-                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content,
-                },
-                credentials: 'same-origin',
-            });
-
-            if (!response.ok) throw new Error('Failed to load conversation');
-
-            const data = await response.json();
-            setMessages(data.messages || []);
-            
-            const lastAgenticMessage = [...(data.messages || [])].reverse().find(m => 
-                m.role === 'assistant' && m.metadata?.execution_results?.length > 0
-            );
-            if (lastAgenticMessage?.metadata?.execution_results) {
-                setCurrentResults(lastAgenticMessage.metadata.execution_results);
-            }
-        } catch (err) {
-            console.error('Error loading conversation:', err);
-            setError('Failed to load conversation');
-        }
-    };
+    // ========================================================================
+    // Derived State
+    // ========================================================================
 
     const suggestions = [
         "Analyze the distribution of values in my data",
@@ -485,36 +678,43 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
         "Export my analysis to Excel",
     ];
 
-    const displayStreamingMessage = streamingMessage ? {
-        ...streamingMessage,
-        thinking: streamingThinking || null,
-        content: streamingContent || '',
-        metadata: {
-            execution_results: streamingExecutions,
-        },
+    const displayStreamingMessage = streaming.message ? {
+        ...streaming.message,
+        thinking: streaming.thinking || null,
+        content: streaming.content || '',
+        metadata: { execution_results: streaming.executions },
     } : null;
 
-    const hasResultFiles = currentResults.some(r => 
+    const hasResultFiles = results.items.some(r =>
         (r.charts && r.charts.length > 0) || (r.files && r.files.length > 0)
     );
 
+    // ========================================================================
+    // Render
+    // ========================================================================
+
     return (
-        <AppLayout title="Chat" currentConversationId={currentConversation?.id}>
+        <AppLayout title="Chat" currentConversationId={conversation?.id}>
             <Head title="Chat" />
 
             <div className="h-[calc(100vh-8rem)] flex">
-                {/* Main chat area - now full width */}
-                <div className={`flex-1 flex flex-col min-w-0 bg-white rounded-lg border border-paper-200 ${showResults && hasResultFiles ? 'lg:mr-4' : ''}`}>
+                {/* Main chat area */}
+                <div className={`flex-1 flex flex-col min-w-0 bg-white rounded-lg border border-paper-200 ${results.show && hasResultFiles ? 'lg:mr-4' : ''}`}>
                     {error && (
                         <div className="flex-shrink-0 mx-4 mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm flex items-center justify-between">
                             <span>{error}</span>
-                            <button onClick={() => setError(null)} className="ml-2 text-red-500 hover:text-red-700 font-bold">✕</button>
+                            <button
+                                onClick={() => dispatch({ type: ActionTypes.CLEAR_ERROR })}
+                                className="ml-2 text-red-500 hover:text-red-700 font-bold"
+                            >
+                                ✕
+                            </button>
                         </div>
                     )}
 
                     <div className="flex-1 overflow-y-auto">
                         <div className="max-w-3xl mx-auto px-4 py-6">
-                            {messages.length === 0 && !isLoading && !displayStreamingMessage ? (
+                            {messages.length === 0 && !loading.isLoading && !displayStreamingMessage ? (
                                 <div className="h-full min-h-[400px] flex items-center justify-center">
                                     <EmptyState
                                         illustration="chat"
@@ -546,15 +746,12 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                                             message={message}
                                             onSaveScript={
                                                 (message.code || message.metadata?.execution_results?.some(e => e.code))
-                                                    ? () => handleSaveScript(message) 
+                                                    ? () => handleSaveScript(message)
                                                     : null
                                             }
                                             onViewResults={
                                                 message.metadata?.execution_results?.some(r => r.charts?.length > 0 || r.files?.length > 0)
-                                                    ? () => {
-                                                        setCurrentResults(message.metadata.execution_results);
-                                                        setShowResults(true);
-                                                    } 
+                                                    ? () => handleViewResults(message.metadata.execution_results)
                                                     : null
                                             }
                                         />
@@ -568,14 +765,14 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                                         />
                                     )}
 
-                                    {isLoading && !displayStreamingMessage && (
-                                        <LoadingIndicator status={loadingStatus} />
+                                    {loading.isLoading && !displayStreamingMessage && (
+                                        <LoadingIndicator status={loading.status} />
                                     )}
-                                    
-                                    {isLoading && displayStreamingMessage && loadingStatus && (
+
+                                    {loading.isLoading && displayStreamingMessage && loading.status && (
                                         <div className="flex items-center gap-2 text-sm text-paper-500 ml-12">
-                                            <div className="w-4 h-4 border-2 border-punch-200 border-t-punch-500 rounded-full animate-spin"></div>
-                                            {loadingStatus}
+                                            <div className="w-4 h-4 border-2 border-punch-200 border-t-punch-500 rounded-full animate-spin" />
+                                            {loading.status}
                                         </div>
                                     )}
 
@@ -589,7 +786,7 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                         <div className="max-w-3xl mx-auto px-4 py-4">
                             <ChatInput
                                 onSend={handleSend}
-                                disabled={isLoading}
+                                disabled={loading.isLoading}
                                 placeholder="Describe what you want to analyze..."
                             />
                         </div>
@@ -599,20 +796,20 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                 {/* Results panel */}
                 {hasResultFiles && (
                     <div className={`hidden lg:block lg:w-96 lg:flex-shrink-0 transition-all duration-300 ${
-                        showResults ? 'lg:opacity-100' : 'lg:opacity-0 lg:w-0 lg:overflow-hidden'
+                        results.show ? 'lg:opacity-100' : 'lg:opacity-0 lg:w-0 lg:overflow-hidden'
                     }`}>
                         <ResultsPanel
-                            results={currentResults}
-                            isVisible={showResults}
-                            onClose={() => setShowResults(false)}
+                            results={results.items}
+                            isVisible={results.show}
+                            onClose={() => dispatch({ type: ActionTypes.HIDE_RESULTS })}
                         />
                     </div>
                 )}
 
                 {/* Mobile results button */}
-                {hasResultFiles && !showResults && (
+                {hasResultFiles && !results.show && (
                     <button
-                        onClick={() => setShowResults(true)}
+                        onClick={() => dispatch({ type: ActionTypes.SHOW_RESULTS })}
                         className="lg:hidden fixed bottom-24 right-4 z-30 bg-punch-500 text-white px-4 py-2 rounded-full shadow-lg flex items-center gap-2"
                     >
                         <ChartIcon className="w-5 h-5" />
@@ -623,7 +820,7 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
 
             <SaveScriptModal
                 isOpen={saveModal.isOpen}
-                onClose={() => setSaveModal({ isOpen: false, code: '', language: 'python' })}
+                onClose={() => dispatch({ type: ActionTypes.CLOSE_SAVE_MODAL })}
                 code={saveModal.code}
                 language={saveModal.language}
                 onSave={handleSaveToLibrary}
@@ -631,6 +828,10 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
         </AppLayout>
     );
 }
+
+// ============================================================================
+// Helper Components
+// ============================================================================
 
 function LoadingIndicator({ status }) {
     return (
@@ -642,7 +843,7 @@ function LoadingIndicator({ status }) {
                 <div className="bg-paper-50 rounded-lg p-4 border border-paper-200">
                     <div className="flex items-center gap-3">
                         <div className="relative">
-                            <div className="w-5 h-5 border-2 border-punch-200 border-t-punch-500 rounded-full animate-spin"></div>
+                            <div className="w-5 h-5 border-2 border-punch-200 border-t-punch-500 rounded-full animate-spin" />
                         </div>
                         <div className="flex-1">
                             <p className="text-paper-700 text-sm font-medium">
@@ -651,9 +852,9 @@ function LoadingIndicator({ status }) {
                         </div>
                     </div>
                     <div className="flex gap-1 mt-3">
-                        <div className="w-2 h-2 bg-punch-300 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
-                        <div className="w-2 h-2 bg-punch-300 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
-                        <div className="w-2 h-2 bg-punch-300 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                        <div className="w-2 h-2 bg-punch-300 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                        <div className="w-2 h-2 bg-punch-300 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                        <div className="w-2 h-2 bg-punch-300 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
                     </div>
                 </div>
             </div>
