@@ -268,25 +268,16 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
 
     const createConversation = async () => {
         try {
-            const response = await fetch('/api/chat/conversations', {
-                method: 'POST',
-                headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json',
-                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content,
-                },
-                credentials: 'same-origin',
-            });
-
-            if (!response.ok) throw new Error('Failed to create conversation');
-
-            const data = await response.json();
-            dispatch({ type: ActionTypes.SET_CONVERSATION, payload: data.conversation });
+            const response = await window.axios.post('/api/chat/conversations');
+            dispatch({ type: ActionTypes.SET_CONVERSATION, payload: response.data.conversation });
             router.reload({ only: ['chatConversations'] });
-            return data.conversation;
+            return response.data.conversation;
         } catch (err) {
             console.error('Error creating conversation:', err);
-            dispatch({ type: ActionTypes.SET_ERROR, payload: 'Failed to start conversation' });
+            const message = err.response?.status === 419
+                ? 'Session expired - please refresh the page'
+                : err.response?.data?.message || 'Failed to start conversation';
+            dispatch({ type: ActionTypes.SET_ERROR, payload: message });
             return null;
         }
     };
@@ -295,39 +286,20 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
         const formData = new FormData();
         formData.append('file', file);
 
-        const response = await fetch('/api/files', {
-            method: 'POST',
-            body: formData,
-            headers: {
-                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content,
-                'Accept': 'application/json',
-            },
-            credentials: 'same-origin',
+        const response = await window.axios.post('/api/files', formData, {
+            headers: { 'Content-Type': 'multipart/form-data' },
         });
 
-        if (!response.ok) {
-            const data = await response.json();
-            throw new Error(data.message || 'Upload failed');
-        }
-
-        return (await response.json()).file;
+        return response.data.file;
     };
 
     const loadConversation = async (conv) => {
         dispatch({ type: ActionTypes.LOAD_CONVERSATION, payload: { conversation: conv } });
 
         try {
-            const response = await fetch(`/api/chat/conversations/${conv.id}`, {
-                headers: {
-                    'Accept': 'application/json',
-                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content,
-                },
-                credentials: 'same-origin',
-            });
+            const response = await window.axios.get(`/api/chat/conversations/${conv.id}`);
+            const data = response.data;
 
-            if (!response.ok) throw new Error('Failed to load conversation');
-
-            const data = await response.json();
             dispatch({ type: ActionTypes.SET_MESSAGES, payload: data.messages || [] });
 
             const lastAgenticMessage = [...(data.messages || [])].reverse().find(m =>
@@ -427,14 +399,18 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                     'Accept': 'text/event-stream',
                     'Content-Type': 'application/json',
                     'X-CSRF-TOKEN': csrfToken,
+                    'X-Requested-With': 'XMLHttpRequest',
                 },
-                credentials: 'same-origin',
+                credentials: 'include',
                 signal,
                 body: JSON.stringify({
                     message: content,
                     file_ids: fileIds.length > 0 ? fileIds : undefined,
                 }),
             }).then(async response => {
+                if (response.status === 419) {
+                    throw new Error('Session expired - please refresh the page');
+                }
                 if (!response.ok) {
                     const errorData = await response.json().catch(() => ({}));
                     throw new Error(errorData.error || errorData.message || 'Stream request failed');
@@ -639,26 +615,11 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
 
     const handleSaveToLibrary = async (scriptData) => {
         try {
-            const response = await fetch('/api/scripts', {
-                method: 'POST',
-                headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json',
-                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content,
-                },
-                credentials: 'same-origin',
-                body: JSON.stringify(scriptData),
-            });
-
-            if (!response.ok) {
-                const data = await response.json();
-                throw new Error(data.message || 'Failed to save script');
-            }
-
+            await window.axios.post('/api/scripts', scriptData);
             dispatch({ type: ActionTypes.CLOSE_SAVE_MODAL });
         } catch (err) {
             console.error('Error saving script:', err);
-            throw err;
+            throw new Error(err.response?.data?.message || 'Failed to save script');
         }
     };
 
