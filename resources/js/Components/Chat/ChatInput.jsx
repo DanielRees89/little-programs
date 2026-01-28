@@ -1,12 +1,15 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@/Components/UI';
 
 export default function ChatInput({ onSend, disabled = false, placeholder }) {
     const [message, setMessage] = useState('');
     const [attachedFiles, setAttachedFiles] = useState([]);
     const [isDragging, setIsDragging] = useState(false);
+    const [fileValidationError, setFileValidationError] = useState(null);
     const textareaRef = useRef(null);
     const fileInputRef = useRef(null);
+    // Track object URLs for cleanup
+    const objectUrlsRef = useRef(new Map());
 
     // Auto-resize textarea
     useEffect(() => {
@@ -17,12 +20,29 @@ export default function ChatInput({ onSend, disabled = false, placeholder }) {
         }
     }, [message]);
 
+    // Cleanup object URLs on unmount
+    useEffect(() => {
+        return () => {
+            // Revoke all object URLs when component unmounts
+            objectUrlsRef.current.forEach((url) => {
+                URL.revokeObjectURL(url);
+            });
+            objectUrlsRef.current.clear();
+        };
+    }, []);
+
     const handleSubmit = (e) => {
         e.preventDefault();
         if ((message.trim() || attachedFiles.length > 0) && !disabled) {
             onSend(message.trim(), attachedFiles);
             setMessage('');
+            // Cleanup all object URLs when submitting
+            objectUrlsRef.current.forEach((url) => {
+                URL.revokeObjectURL(url);
+            });
+            objectUrlsRef.current.clear();
             setAttachedFiles([]);
+            setFileValidationError(null);
         }
     };
 
@@ -43,28 +63,77 @@ export default function ChatInput({ onSend, disabled = false, placeholder }) {
     };
 
     const addFiles = (files) => {
-        const validFiles = files.filter(file => {
-            const validTypes = [
-                'text/csv',
-                'application/pdf',
-                'image/png',
-                'image/jpeg',
-                'image/gif',
-                'image/webp',
-                'text/plain',
-                'application/json',
-                'application/vnd.ms-excel',
-                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            ];
-            const maxSize = 10 * 1024 * 1024; // 10MB
-            return validTypes.includes(file.type) && file.size <= maxSize;
-        });
+        const validMimeTypes = [
+            'text/csv',
+            'application/pdf',
+            'image/png',
+            'image/jpeg',
+            'image/gif',
+            'image/webp',
+            'text/plain',
+            'application/json',
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/octet-stream', // Allow this, but validate by extension
+        ];
 
-        setAttachedFiles(prev => [...prev, ...validFiles].slice(0, 5)); // Max 5 files
+        // Extension-based validation as fallback for unreliable MIME types
+        const validExtensions = [
+            '.csv', '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.webp',
+            '.txt', '.json', '.xls', '.xlsx'
+        ];
+
+        const maxSize = 10 * 1024 * 1024; // 10MB
+        const maxFiles = 5;
+        const currentCount = attachedFiles.length;
+
+        let rejectedFiles = [];
+        let validFiles = [];
+
+        for (const file of files) {
+            const extension = '.' + (file.name.split('.').pop()?.toLowerCase() || '');
+            const isMimeValid = validMimeTypes.includes(file.type);
+            const isExtensionValid = validExtensions.includes(extension);
+
+            // Accept if MIME type is valid, OR if extension is valid (for unreliable MIME types)
+            const isTypeValid = isMimeValid || isExtensionValid;
+
+            if (!isTypeValid) {
+                rejectedFiles.push({ name: file.name, reason: 'Unsupported file type' });
+            } else if (file.size > maxSize) {
+                rejectedFiles.push({ name: file.name, reason: 'File too large (max 10MB)' });
+            } else if (currentCount + validFiles.length >= maxFiles) {
+                rejectedFiles.push({ name: file.name, reason: 'Maximum 5 files allowed' });
+            } else {
+                validFiles.push(file);
+            }
+        }
+
+        // Show validation error if any files were rejected
+        if (rejectedFiles.length > 0) {
+            const errorMsg = rejectedFiles
+                .map(f => `${f.name}: ${f.reason}`)
+                .join(', ');
+            setFileValidationError(errorMsg);
+            // Auto-clear error after 5 seconds
+            setTimeout(() => setFileValidationError(null), 5000);
+        }
+
+        if (validFiles.length > 0) {
+            setAttachedFiles(prev => [...prev, ...validFiles].slice(0, maxFiles));
+        }
     };
 
     const removeFile = (index) => {
-        setAttachedFiles(prev => prev.filter((_, i) => i !== index));
+        setAttachedFiles(prev => {
+            const fileToRemove = prev[index];
+            // Cleanup object URL for the removed file
+            if (fileToRemove && objectUrlsRef.current.has(fileToRemove)) {
+                URL.revokeObjectURL(objectUrlsRef.current.get(fileToRemove));
+                objectUrlsRef.current.delete(fileToRemove);
+            }
+            return prev.filter((_, i) => i !== index);
+        });
     };
 
     const handleDragOver = (e) => {
@@ -117,22 +186,46 @@ export default function ChatInput({ onSend, disabled = false, placeholder }) {
         }
     };
 
-    // Generate preview URL for image files
-    const getFilePreview = (file) => {
+    // Generate preview URL for image files (with caching to prevent memory leaks)
+    const getFilePreview = useCallback((file) => {
         if (file.type.startsWith('image/')) {
-            return URL.createObjectURL(file);
+            // Check if we already have a URL for this file
+            if (objectUrlsRef.current.has(file)) {
+                return objectUrlsRef.current.get(file);
+            }
+            // Create new URL and cache it
+            const url = URL.createObjectURL(file);
+            objectUrlsRef.current.set(file, url);
+            return url;
         }
         return null;
-    };
+    }, []);
 
     return (
-        <form 
-            onSubmit={handleSubmit} 
+        <form
+            onSubmit={handleSubmit}
             className={`border-t border-paper-200 p-4 bg-white transition-colors ${isDragging ? 'bg-punch-50' : ''}`}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
         >
+            {/* File validation error */}
+            {fileValidationError && (
+                <div className="mb-3 p-2 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm flex items-center justify-between">
+                    <span className="flex items-center gap-2">
+                        <AlertIcon className="w-4 h-4 flex-shrink-0" />
+                        <span>{fileValidationError}</span>
+                    </span>
+                    <button
+                        type="button"
+                        onClick={() => setFileValidationError(null)}
+                        className="p-1 hover:bg-red-100 rounded transition-colors"
+                    >
+                        <XIcon className="w-4 h-4" />
+                    </button>
+                </div>
+            )}
+
             {/* Attached files preview */}
             {attachedFiles.length > 0 && (
                 <div className="flex flex-wrap gap-2 mb-3">
@@ -150,11 +243,10 @@ export default function ChatInput({ onSend, disabled = false, placeholder }) {
                             >
                                 {imagePreview ? (
                                     <>
-                                        <img 
-                                            src={imagePreview} 
+                                        <img
+                                            src={imagePreview}
                                             alt={file.name}
                                             className="w-full h-full object-cover"
-                                            onLoad={() => URL.revokeObjectURL(imagePreview)}
                                         />
                                         <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors flex items-center justify-center">
                                             <button
@@ -291,6 +383,14 @@ function XIcon({ className }) {
     return (
         <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" />
+        </svg>
+    );
+}
+
+function AlertIcon({ className }) {
+    return (
+        <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
         </svg>
     );
 }

@@ -1,4 +1,20 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import hljs from 'highlight.js/lib/core';
+import python from 'highlight.js/lib/languages/python';
+import javascript from 'highlight.js/lib/languages/javascript';
+import json from 'highlight.js/lib/languages/json';
+import bash from 'highlight.js/lib/languages/bash';
+import sql from 'highlight.js/lib/languages/sql';
+import 'highlight.js/styles/github-dark.css';
+
+// Register languages
+hljs.registerLanguage('python', python);
+hljs.registerLanguage('javascript', javascript);
+hljs.registerLanguage('js', javascript);
+hljs.registerLanguage('json', json);
+hljs.registerLanguage('bash', bash);
+hljs.registerLanguage('shell', bash);
+hljs.registerLanguage('sql', sql);
 
 export default function CodeBlock({
     code,
@@ -11,10 +27,43 @@ export default function CodeBlock({
     className = '',
 }) {
     const [copied, setCopied] = useState(false);
+    const codeRef = useRef(null);
+
+    // Apply syntax highlighting
+    useEffect(() => {
+        if (codeRef.current && code) {
+            try {
+                // Check if language is supported
+                if (hljs.getLanguage(language)) {
+                    const result = hljs.highlight(code, { language });
+                    codeRef.current.innerHTML = result.value;
+                } else {
+                    // Fallback: escape HTML and display as plain text
+                    codeRef.current.textContent = code;
+                }
+            } catch (err) {
+                // Fallback on error
+                codeRef.current.textContent = code;
+            }
+        }
+    }, [code, language]);
 
     const handleCopy = async () => {
         try {
-            await navigator.clipboard.writeText(code);
+            // Try modern clipboard API first
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(code);
+            } else {
+                // Fallback for non-HTTPS or older browsers
+                const textArea = document.createElement('textarea');
+                textArea.value = code;
+                textArea.style.position = 'fixed';
+                textArea.style.left = '-999999px';
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+            }
             setCopied(true);
             setTimeout(() => setCopied(false), 2000);
         } catch (err) {
@@ -105,13 +154,13 @@ export default function CodeBlock({
                             {/* Code column */}
                             <div className="flex-1 min-w-0 overflow-x-auto">
                                 <pre className="text-paper-100">
-                                    <code>{code}</code>
+                                    <code ref={codeRef} className="hljs" />
                                 </pre>
                             </div>
                         </div>
                     ) : (
                         <pre className="text-paper-100 overflow-x-auto">
-                            <code>{code}</code>
+                            <code ref={codeRef} className="hljs" />
                         </pre>
                     )}
                 </div>
@@ -123,10 +172,38 @@ export default function CodeBlock({
 // Compact version for inline/chat use
 export function CodeBlockCompact({ code, language = 'python', onSave }) {
     const [copied, setCopied] = useState(false);
+    const codeRef = useRef(null);
+
+    // Apply syntax highlighting
+    useEffect(() => {
+        if (codeRef.current && code) {
+            try {
+                if (hljs.getLanguage(language)) {
+                    const result = hljs.highlight(code, { language });
+                    codeRef.current.innerHTML = result.value;
+                } else {
+                    codeRef.current.textContent = code;
+                }
+            } catch (err) {
+                codeRef.current.textContent = code;
+            }
+        }
+    }, [code, language]);
 
     const handleCopy = async () => {
         try {
-            await navigator.clipboard.writeText(code);
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(code);
+            } else {
+                const textArea = document.createElement('textarea');
+                textArea.value = code;
+                textArea.style.position = 'fixed';
+                textArea.style.left = '-999999px';
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+            }
             setCopied(true);
             setTimeout(() => setCopied(false), 2000);
         } catch (err) {
@@ -166,7 +243,7 @@ export function CodeBlockCompact({ code, language = 'python', onSave }) {
             {/* Code content */}
             <div className="p-3 overflow-x-auto">
                 <pre className="text-sm font-mono text-paper-100 leading-relaxed">
-                    <code>{code}</code>
+                    <code ref={codeRef} className="hljs" />
                 </pre>
             </div>
         </div>

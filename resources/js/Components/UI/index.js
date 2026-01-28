@@ -7,3 +7,6 @@ export { default as Input } from './Input';
 export { default as Markdown } from './Markdown';
 export { default as Modal } from './Modal';
 export { default as ThinkingBlock } from './ThinkingBlock';
+
+// Icons - centralized icon components
+export * from './Icons';

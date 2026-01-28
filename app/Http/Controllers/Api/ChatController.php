@@ -100,14 +100,33 @@ class ChatController extends Controller
             return response()->json(['message' => 'Not found'], 404);
         }
 
-        $messages = $conversation->messages()
-            ->orderBy('created_at', 'asc')
-            ->get()
-            ->map(fn($msg) => $this->formatMessage($msg));
+        // Pagination parameters
+        $limit = min((int) $request->input('limit', 50), 100); // Max 100 messages per request
+        $beforeId = $request->input('before'); // Cursor for older messages
+
+        $query = $conversation->messages()->orderBy('created_at', 'desc');
+
+        // If loading older messages, filter by cursor
+        if ($beforeId) {
+            $query->where('id', '<', $beforeId);
+        }
+
+        // Get one extra to check if there are more messages
+        $messagesRaw = $query->limit($limit + 1)->get();
+        $hasMore = $messagesRaw->count() > $limit;
+
+        // Remove the extra message and reverse to get chronological order
+        $messages = $messagesRaw->take($limit)->reverse()->values();
 
         return response()->json([
             'conversation' => $this->formatConversation($conversation),
-            'messages' => $messages,
+            'messages' => $messages->map(fn($msg) => $this->formatMessage($msg)),
+            'pagination' => [
+                'has_more' => $hasMore,
+                'oldest_id' => $messages->first()?->id,
+                'newest_id' => $messages->last()?->id,
+                'limit' => $limit,
+            ],
         ]);
     }
 
