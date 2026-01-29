@@ -39,6 +39,7 @@ Route::middleware(['web', 'auth'])->group(function () {
     Route::delete('/chat/conversations/{conversation}', [ChatController::class, 'destroy']);
     Route::post('/chat/conversations/{conversation}/messages', [ChatController::class, 'sendMessage']);
     Route::post('/chat/conversations/{conversation}/messages/stream', [ChatController::class, 'streamMessage']);
+    Route::post('/chat/conversations/{conversation}/regenerate', [ChatController::class, 'regenerateResponse']);
     
     // Chat Execution Files (for AI-generated files)
     // Supports both temp_XXX (legacy) and session_XXX (persistent) formats

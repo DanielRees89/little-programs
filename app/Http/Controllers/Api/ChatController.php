@@ -104,7 +104,8 @@ class ChatController extends Controller
         $limit = min((int) $request->input('limit', 50), 100); // Max 100 messages per request
         $beforeId = $request->input('before'); // Cursor for older messages
 
-        $query = $conversation->messages()->orderBy('created_at', 'desc');
+        // Order by ID desc to get newest messages first (for pagination)
+        $query = $conversation->messages()->orderBy('id', 'desc');
 
         // If loading older messages, filter by cursor
         if ($beforeId) {
@@ -115,7 +116,7 @@ class ChatController extends Controller
         $messagesRaw = $query->limit($limit + 1)->get();
         $hasMore = $messagesRaw->count() > $limit;
 
-        // Remove the extra message and reverse to get chronological order
+        // Remove the extra message and reverse to get chronological order (oldest first)
         $messages = $messagesRaw->take($limit)->reverse()->values();
 
         return response()->json([
@@ -262,8 +263,9 @@ class ChatController extends Controller
 
     protected function buildMessageHistory(ChatConversation $conversation, $user): array
     {
+        // Explicitly order ASC for chronological message history
         return $conversation->messages()
-            ->orderBy('created_at', 'asc')
+            ->orderBy('id', 'asc')
             ->get()
             ->map(function ($msg) use ($user) {
                 $data = [
@@ -564,6 +566,56 @@ class ChatController extends Controller
     public function streamMessage(Request $request, ChatConversation $conversation): StreamedResponse|JsonResponse
     {
         return $this->sendMessage($request, $conversation);
+    }
+
+    /**
+     * Regenerate a response for the last user message in the conversation.
+     * Used when a previous response was interrupted (user navigated away).
+     */
+    public function regenerateResponse(Request $request, ChatConversation $conversation): StreamedResponse|JsonResponse
+    {
+        if ($conversation->user_id !== $request->user()->id) {
+            return response()->json(['message' => 'Not found'], 404);
+        }
+
+        $user = $request->user();
+
+        // Get the last user message
+        $lastUserMessage = $conversation->messages()
+            ->where('role', 'user')
+            ->orderBy('id', 'desc')
+            ->first();
+
+        if (!$lastUserMessage) {
+            return response()->json(['message' => 'No user message found to regenerate'], 400);
+        }
+
+        // Collect all data files from the conversation
+        $conversationDataFileIds = $conversation->messages()
+            ->whereNotNull('metadata->attached_files')
+            ->orderBy('id', 'asc')
+            ->get()
+            ->pluck('metadata.attached_files')
+            ->flatten(1)
+            ->filter(fn($f) => empty($f['is_image']))
+            ->pluck('id')
+            ->unique()
+            ->toArray();
+
+        $allDataFiles = DataFile::whereIn('id', $conversationDataFileIds)
+            ->where('user_id', $user->id)
+            ->get()
+            ->toArray();
+
+        $messageHistory = $this->buildMessageHistory($conversation, $user);
+
+        return $this->streamResponse(
+            $conversation,
+            $lastUserMessage,
+            $messageHistory,
+            $user->name,
+            $allDataFiles
+        );
     }
 
     protected function sendSSE(string $event, array $data): void
