@@ -21,6 +21,8 @@ const initialState = {
         content: '',
         executions: [],
     },
+    // Track if the last response was interrupted (user navigated away mid-stream)
+    interruptedResponse: null, // { messageId, content } of the user message that was never responded to
 };
 
 const ActionTypes = {
@@ -45,6 +47,8 @@ const ActionTypes = {
     UPDATE_STREAMING_EXECUTION: 'UPDATE_STREAMING_EXECUTION',
     RESET_STREAMING: 'RESET_STREAMING',
     LOAD_CONVERSATION: 'LOAD_CONVERSATION',
+    SET_INTERRUPTED_RESPONSE: 'SET_INTERRUPTED_RESPONSE',
+    CLEAR_INTERRUPTED_RESPONSE: 'CLEAR_INTERRUPTED_RESPONSE',
 };
 
 function chatReducer(state, action) {
@@ -73,13 +77,27 @@ function chatReducer(state, action) {
             };
 
         // Combined action: finalize messages AND reset streaming in ONE atomic update
-        // This prevents the brief moment where both streaming message and finalized message appear
+        // This prevents the double message issue where both streaming
+        // message and finalized message appear simultaneously
         case ActionTypes.FINALIZE_AND_RESET: {
-            const { tempId, userMessage, assistantMessage } = action.payload;
-            const filtered = state.messages.filter(m => m.id !== tempId);
+            const { assistantMessage, tempUserMessageId, serverUserMessage } = action.payload;
+
+            // Remove the temp user message from the array
+            const filteredMessages = state.messages.filter(m => m.id !== tempUserMessageId);
+
+            // Build the final messages array:
+            // 1. All existing messages (except the temp one)
+            // 2. The server-confirmed user message (with real DB id), or the temp if server didn't send one
+            // 3. The assistant message
+            const userMessageToAdd = serverUserMessage || state.messages.find(m => m.id === tempUserMessageId);
+
+            const finalMessages = userMessageToAdd
+                ? [...filteredMessages, userMessageToAdd, assistantMessage]
+                : [...filteredMessages, assistantMessage];
+
             return {
                 ...state,
-                messages: [...filtered, userMessage, assistantMessage],
+                messages: finalMessages,
                 // Reset streaming in the same update
                 streaming: {
                     message: null,
@@ -202,6 +220,19 @@ function chatReducer(state, action) {
                 error: null,
                 streaming: initialState.streaming,
                 results: { show: false, items: [] },
+                interruptedResponse: null,
+            };
+
+        case ActionTypes.SET_INTERRUPTED_RESPONSE:
+            return {
+                ...state,
+                interruptedResponse: action.payload,
+            };
+
+        case ActionTypes.CLEAR_INTERRUPTED_RESPONSE:
+            return {
+                ...state,
+                interruptedResponse: null,
             };
 
         default:
@@ -232,6 +263,7 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
         saveModal,
         results,
         streaming,
+        interruptedResponse,
     } = state;
 
     // ========================================================================
@@ -308,10 +340,24 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
         try {
             const response = await window.axios.get(`/api/chat/conversations/${conv.id}`);
             const data = response.data;
+            const loadedMessages = data.messages || [];
 
-            dispatch({ type: ActionTypes.SET_MESSAGES, payload: data.messages || [] });
+            dispatch({ type: ActionTypes.SET_MESSAGES, payload: loadedMessages });
 
-            const lastAgenticMessage = [...(data.messages || [])].reverse().find(m =>
+            // Check if the last message is from the user (indicating an interrupted response)
+            // This happens when user navigates away while waiting for AI response
+            const lastMessage = loadedMessages[loadedMessages.length - 1];
+            if (lastMessage && lastMessage.role === 'user') {
+                dispatch({
+                    type: ActionTypes.SET_INTERRUPTED_RESPONSE,
+                    payload: {
+                        messageId: lastMessage.id,
+                        content: lastMessage.content,
+                    },
+                });
+            }
+
+            const lastAgenticMessage = [...loadedMessages].reverse().find(m =>
                 m.role === 'assistant' && m.metadata?.execution_results?.length > 0
             );
             if (lastAgenticMessage?.metadata?.execution_results) {
@@ -379,6 +425,8 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
             }
 
             dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Thinking...' } });
+            // Clear interrupted response since we're starting a new request
+            dispatch({ type: ActionTypes.CLEAR_INTERRUPTED_RESPONSE });
             await sendStreamingMessage(conv.id, content, fileIds, userMessage);
             router.reload({ only: ['chatConversations'] });
         } catch (err) {
@@ -390,6 +438,226 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
             return;
         }
     }, [conversation]);
+
+    // Retry an interrupted response - regenerate response for the last user message
+    const handleRetryInterrupted = useCallback(async () => {
+        if (!interruptedResponse || !conversation) return;
+
+        dispatch({ type: ActionTypes.CLEAR_ERROR });
+        dispatch({ type: ActionTypes.SET_LOADING, payload: { isLoading: true, status: 'Retrying...' } });
+        dispatch({ type: ActionTypes.RESET_STREAMING });
+        dispatch({ type: ActionTypes.CLEAR_INTERRUPTED_RESPONSE });
+
+        try {
+            dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Thinking...' } });
+            await sendRegenerateRequest(conversation.id);
+            router.reload({ only: ['chatConversations'] });
+        } catch (err) {
+            console.error('Error retrying message:', err);
+            dispatch({ type: ActionTypes.SET_LOADING, payload: { isLoading: false, status: '' } });
+            dispatch({ type: ActionTypes.RESET_STREAMING });
+            dispatch({ type: ActionTypes.SET_ERROR, payload: err.message || 'Failed to retry' });
+        }
+    }, [conversation, interruptedResponse]);
+
+    // Send a regenerate request to get a response for the last user message
+    const sendRegenerateRequest = async (conversationId) => {
+        if (abortControllerRef.current) {
+            abortControllerRef.current.abort();
+        }
+
+        abortControllerRef.current = new AbortController();
+        const { signal } = abortControllerRef.current;
+
+        return new Promise((resolve, reject) => {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
+
+            fetch(`/api/chat/conversations/${conversationId}/regenerate`, {
+                method: 'POST',
+                headers: {
+                    'Accept': 'text/event-stream',
+                    'Content-Type': 'application/json',
+                    'X-CSRF-TOKEN': csrfToken,
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                credentials: 'include',
+                signal,
+            }).then(async response => {
+                if (response.status === 419) {
+                    throw new Error('Session expired - please refresh the page');
+                }
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.error || errorData.message || 'Regenerate request failed');
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+
+                let currentThinking = '';
+                let currentContent = '';
+                let currentExecutions = [];
+                let buffer = '';
+                let finalMessage = null;
+
+                const streamingMsgId = `streaming-${Date.now()}`;
+                dispatch({
+                    type: ActionTypes.START_STREAMING,
+                    payload: {
+                        id: streamingMsgId,
+                        role: 'assistant',
+                        content: '',
+                        thinking: '',
+                        created_at: new Date().toISOString(),
+                    },
+                });
+
+                const processEvent = (eventType, data) => {
+                    switch (eventType) {
+                        case 'user_message':
+                            // For regenerate, we already have the user message, ignore this
+                            break;
+
+                        case 'thinking':
+                            currentThinking = data.full || data.content || '';
+                            dispatch({ type: ActionTypes.UPDATE_STREAMING_THINKING, payload: currentThinking });
+                            dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Thinking...' } });
+                            break;
+
+                        case 'tool_call':
+                            dispatch({ type: ActionTypes.SET_LOADING, payload: { status: `Running Python (step ${data.step || 1})...` } });
+                            const newExec = { code: data.code, status: 'running', step: data.step };
+                            currentExecutions = [...currentExecutions, newExec];
+                            dispatch({ type: ActionTypes.ADD_STREAMING_EXECUTION, payload: newExec });
+                            break;
+
+                        case 'tool_result':
+                            const execUpdate = {
+                                status: 'complete',
+                                success: data.success,
+                                output: data.output,
+                                error: data.error,
+                                charts: data.charts || [],
+                                files: data.files || [],
+                                execution_id: data.execution_id,
+                            };
+                            const lastIdx = currentExecutions.length - 1;
+                            if (lastIdx >= 0) {
+                                currentExecutions[lastIdx] = { ...currentExecutions[lastIdx], ...execUpdate };
+                            }
+                            dispatch({ type: ActionTypes.UPDATE_STREAMING_EXECUTION, payload: execUpdate });
+
+                            if (data.success) {
+                                dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Code executed successfully' } });
+                            } else {
+                                dispatch({ type: ActionTypes.SET_LOADING, payload: { status: 'Code failed, AI is fixing...' } });
+                            }
+                            break;
+
+                        case 'text_delta':
+                            const delta = data.delta || '';
+                            currentContent += delta;
+                            dispatch({ type: ActionTypes.UPDATE_STREAMING_CONTENT, payload: delta });
+                            dispatch({ type: ActionTypes.SET_LOADING, payload: { status: '' } });
+                            break;
+
+                        case 'complete':
+                            finalMessage = data.assistant_message;
+                            break;
+
+                        case 'error':
+                            throw new Error(data.message || 'Stream error');
+
+                        case 'done':
+                            break;
+                    }
+                };
+
+                const processLine = (line) => {
+                    if (line.startsWith('event:')) {
+                        buffer = line.slice(6).trim();
+                        return;
+                    }
+
+                    if (line.startsWith('data:')) {
+                        const jsonStr = line.slice(5).trim();
+                        if (!jsonStr || jsonStr === '[DONE]') return;
+
+                        try {
+                            const data = JSON.parse(jsonStr);
+                            const eventType = buffer || data.type || 'unknown';
+                            processEvent(eventType, data);
+                            buffer = '';
+                        } catch (e) {
+                            if (!(e instanceof SyntaxError)) {
+                                console.error('Error processing stream event:', e);
+                            }
+                        }
+                    }
+                };
+
+                const processStream = async () => {
+                    let lineBuffer = '';
+
+                    try {
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+
+                            lineBuffer += decoder.decode(value, { stream: true });
+                            const lines = lineBuffer.split('\n');
+                            lineBuffer = lines.pop() || '';
+
+                            for (const line of lines) {
+                                const trimmed = line.trim();
+                                if (trimmed) processLine(trimmed);
+                            }
+                        }
+
+                        if (lineBuffer.trim()) {
+                            processLine(lineBuffer.trim());
+                        }
+                    } finally {
+                        dispatch({ type: ActionTypes.SET_LOADING, payload: { isLoading: false, status: '' } });
+
+                        const message = finalMessage || {
+                            id: streamingMsgId,
+                            role: 'assistant',
+                            content: currentContent,
+                            thinking: currentThinking || null,
+                            code: extractCode(currentContent),
+                            language: 'python',
+                            created_at: new Date().toISOString(),
+                            metadata: {
+                                execution_results: currentExecutions.filter(e => e.status === 'complete'),
+                                had_tool_calls: currentExecutions.length > 0,
+                            },
+                        };
+
+                        if (message.metadata?.execution_results) {
+                            dispatch({ type: ActionTypes.SET_RESULTS, payload: message.metadata.execution_results });
+                        }
+
+                        // For regenerate, just add the assistant message (user message already exists)
+                        dispatch({ type: ActionTypes.ADD_MESSAGE, payload: message });
+                        dispatch({ type: ActionTypes.RESET_STREAMING });
+
+                        resolve();
+                    }
+                };
+
+                processStream();
+            }).catch(error => {
+                if (error.name === 'AbortError') {
+                    resolve();
+                    return;
+                }
+                dispatch({ type: ActionTypes.SET_LOADING, payload: { isLoading: false, status: '' } });
+                dispatch({ type: ActionTypes.RESET_STREAMING });
+                reject(error);
+            });
+        });
+    };
 
     const sendStreamingMessage = async (conversationId, content, fileIds, tempUserMessage) => {
         // Cancel any existing stream
@@ -434,6 +702,7 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                 let currentExecutions = [];
                 let buffer = '';
                 let finalMessage = null;
+                let serverUserMessage = null; // Track the real user message from server
 
                 const streamingMsgId = `streaming-${Date.now()}`;
                 dispatch({
@@ -449,6 +718,12 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
 
                 const processEvent = (eventType, data) => {
                     switch (eventType) {
+                        // Handle the server-confirmed user message with real database ID
+                        // We don't dispatch here - just save it for FINALIZE_AND_RESET to use
+                        case 'user_message':
+                            serverUserMessage = data;
+                            break;
+
                         case 'thinking':
                             currentThinking = data.full || data.content || '';
                             dispatch({ type: ActionTypes.UPDATE_STREAMING_THINKING, payload: currentThinking });
@@ -575,12 +850,9 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                         dispatch({
                             type: ActionTypes.FINALIZE_AND_RESET,
                             payload: {
-                                tempId: tempUserMessage.id,
-                                userMessage: {
-                                    ...tempUserMessage,
-                                    id: `user-${Date.now()}`,
-                                },
                                 assistantMessage: message,
+                                tempUserMessageId: tempUserMessage.id,
+                                serverUserMessage: serverUserMessage, // Real message from server with DB id
                             },
                         });
 
@@ -738,6 +1010,39 @@ export default function ChatIndex({ conversation: initialConversation = null }) 
                                         />
                                     )}
 
+                                    {/* Show interrupted response indicator with retry button */}
+                                    {interruptedResponse && !loading.isLoading && !displayStreamingMessage && (
+                                        <div className="flex gap-3">
+                                            <div className="w-8 h-8 rounded-full bg-amber-100 flex items-center justify-center flex-shrink-0">
+                                                <WarningIcon className="w-4 h-4 text-amber-600" />
+                                            </div>
+                                            <div className="flex-1">
+                                                <div className="bg-amber-50 rounded-lg p-4 border border-amber-200">
+                                                    <p className="text-amber-800 text-sm font-medium mb-2">
+                                                        Response interrupted
+                                                    </p>
+                                                    <p className="text-amber-700 text-sm mb-3">
+                                                        Your previous request didn't receive a response. Would you like to try again?
+                                                    </p>
+                                                    <div className="flex gap-2">
+                                                        <button
+                                                            onClick={handleRetryInterrupted}
+                                                            className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-sm font-medium rounded transition-colors"
+                                                        >
+                                                            Retry
+                                                        </button>
+                                                        <button
+                                                            onClick={() => dispatch({ type: ActionTypes.CLEAR_INTERRUPTED_RESPONSE })}
+                                                            className="px-3 py-1.5 bg-white hover:bg-amber-100 text-amber-700 text-sm font-medium rounded border border-amber-300 transition-colors"
+                                                        >
+                                                            Dismiss
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
                                     {/* Show LoadingIndicator before streaming starts */}
                                     {loading.isLoading && !displayStreamingMessage && (
                                         <LoadingIndicator status={loading.status} />
@@ -844,6 +1149,14 @@ function SparkleIcon({ className }) {
     return (
         <svg className={className} fill="currentColor" viewBox="0 0 20 20">
             <path d="M10 2a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 0110 2zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 0110 15zm-7-5a.75.75 0 01.75-.75h1.5a.75.75 0 010 1.5h-1.5A.75.75 0 013 10zm13 0a.75.75 0 01.75-.75h1.5a.75.75 0 010 1.5h-1.5A.75.75 0 0116 10z" />
+        </svg>
+    );
+}
+
+function WarningIcon({ className }) {
+    return (
+        <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
         </svg>
     );
 }

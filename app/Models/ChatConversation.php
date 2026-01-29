@@ -37,10 +37,12 @@ class ChatConversation extends Model
 
     /**
      * Get the messages in the conversation.
+     * Note: Do NOT add default ordering here - let each query decide the order
+     * to avoid conflicts with pagination queries.
      */
     public function messages(): HasMany
     {
-        return $this->hasMany(ChatMessage::class)->orderBy('created_at', 'asc');
+        return $this->hasMany(ChatMessage::class);
     }
 
     /**
@@ -70,6 +72,7 @@ class ChatConversation extends Model
 
         $firstMessage = $this->messages()
             ->where('role', 'user')
+            ->orderBy('id', 'asc')
             ->first();
 
         if ($firstMessage) {
